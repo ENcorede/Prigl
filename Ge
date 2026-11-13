@@ -1,18 +1,11 @@
-# bot.py — единый файл, БЕЗ базы данных (всё в памяти, сбрасывается при перезапуске)
-# pip install aiogram==3.13.1
-#
-# Переменные окружения:
-#   BOT_TOKEN / TELEGRAM_BOT_TOKEN / TELEGRAM_TOKEN / TOKEN / API_TOKEN — токен
-#   CHANNEL_ID — числовой ID канала (бот должен быть админом!)
-#   CHANNEL_LINK, ADMIN_ID, INVITES_FOR_CONTEST, NFT_LINK — опционально
-
 import os
 import asyncio
 import random
+
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.filters import CommandStart, Command, CommandObject
 from aiogram.types import (
-    Message, CallbackQuery,
+    Message, CallbackQuery, ChatJoinRequest,
     InlineKeyboardMarkup, InlineKeyboardButton,
     ReplyKeyboardMarkup, KeyboardButton
 )
@@ -20,9 +13,11 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.utils.deep_linking import create_start_link
 
+
 # =========================
 # НАСТРОЙКИ
 # =========================
+
 def _get_env(*names, default=None):
     for n in names:
         v = os.getenv(n)
@@ -30,31 +25,52 @@ def _get_env(*names, default=None):
             return v
     return default
 
+
 BOT_TOKEN = _get_env(
-    "BOT_TOKEN", "TELEGRAM_BOT_TOKEN", "TELEGRAM_TOKEN", "TOKEN", "API_TOKEN"
+    "BOT_TOKEN",
+    "TELEGRAM_BOT_TOKEN",
+    "TELEGRAM_TOKEN",
+    "TOKEN",
+    "API_TOKEN"
 )
+
 if not BOT_TOKEN:
     raise RuntimeError("Не найден токен в переменных окружения.")
 
-CHANNEL_ID = int(_get_env("CHANNEL_ID", "TG_CHANNEL_ID", default="-1001234567890"))
-CHANNEL_LINK = os.getenv("CHANNEL_LINK", "https://t.me/+8ZzwtRJ6xDlmZWMx")
+CHANNEL_ID = int(
+    _get_env("CHANNEL_ID", "TG_CHANNEL_ID", default="-1004373582062")
+)
+
+CHANNEL_LINK = os.getenv(
+    "CHANNEL_LINK",
+    "https://t.me/+8ZzwtRJ6xDlmZWMx"
+)
+
 ADMIN_ID = int(os.getenv("ADMIN_ID", "8332196726"))
 INVITES_FOR_CONTEST = int(os.getenv("INVITES_FOR_CONTEST", "15"))
-NFT_LINK = os.getenv("NFT_LINK", "https://t.me/nft/MythMask-166243")
 
-ANIMALS = ["🐺","🐻","🐻‍❄️","🐶","🐱","🦁","🐯","🐭","🦊","🐗","🐢","🐴","🐸","🐊"]
+NFT_LINK = os.getenv(
+    "NFT_LINK",
+    "https://t.me/nft/MythMask-166243"
+)
+
+ANIMALS = [
+    "🐺", "🐻", "🐻‍❄️", "🐶", "🐱", "🦁", "🐯",
+    "🐭", "🦊", "🐗", "🐢", "🐴", "🐸", "🐊"
+]
+
 
 # =========================
-# ХРАНИЛИЩЕ В ПАМЯТИ
+# ХРАНИЛИЩЕ
 # =========================
-# user_id -> {"username": str, "referrer_id": int|None,
-#             "captcha_ok": bool, "joined_channel": bool,
-#             "purchased_video": bool, "invited_count": int}
+
 users: dict[int, dict] = {}
 captcha_targets: dict[int, str] = {}
 
+
 def get_user(user_id: int):
     return users.get(user_id)
+
 
 def ensure_user(user_id: int, username: str, referrer_id=None):
     if user_id not in users:
@@ -66,23 +82,33 @@ def ensure_user(user_id: int, username: str, referrer_id=None):
             "purchased_video": False,
             "invited_count": 0,
         }
+
     elif referrer_id and users[user_id]["referrer_id"] is None:
         users[user_id]["referrer_id"] = referrer_id
+
+    else:
+        users[user_id]["username"] = username or users[user_id]["username"]
+
     return users[user_id]
+
 
 def get_invited_count(user_id: int) -> int:
     u = users.get(user_id)
     return u["invited_count"] if u else 0
 
+
 # =========================
 # КЛАВИАТУРЫ
 # =========================
+
 def progress_bar(current: int, total: int = 5) -> str:
     filled = "▓" * min(current, total)
     empty = "░" * max(0, total - current)
+
     return f"│{filled}{empty}│ {current}/{total} приглашено"
 
-def main_menu_kb() -> ReplyKeyboardMarkup:
+
+def main_menu_kb():
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="👤 Профиль")],
@@ -92,58 +118,108 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
         resize_keyboard=True
     )
 
-def captcha_kb(emojis: list[str]) -> InlineKeyboardMarkup:
-    buttons = [InlineKeyboardButton(text=e, callback_data=f"cap:{e}") for e in emojis]
-    rows = [buttons[i:i+3] for i in range(0, len(buttons), 3)]
+
+def captcha_kb(emojis: list[str]):
+    buttons = [
+        InlineKeyboardButton(
+            text=e,
+            callback_data=f"cap:{e}"
+        )
+        for e in emojis
+    ]
+
+    rows = [
+        buttons[i:i + 3]
+        for i in range(0, len(buttons), 3)
+    ]
+
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-def channel_join_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📢 Подать заявку в канал", url=CHANNEL_LINK)],
-        [InlineKeyboardButton(text="✅ Я подал заявку", callback_data="check_join")]
-    ])
+
+def channel_join_kb():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📢 Подать заявку в канал",
+                    url=CHANNEL_LINK
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="✅ Проверить подписку",
+                    callback_data="check_join"
+                )
+            ]
+        ]
+    )
+
 
 # =========================
 # КАПЧА
 # =========================
+
 def generate_captcha():
     target = random.choice(ANIMALS)
-    others = random.sample([e for e in ANIMALS if e != target], 8)
+
+    others = random.sample(
+        [e for e in ANIMALS if e != target],
+        8
+    )
+
     emojis = [target] + others
     random.shuffle(emojis)
+
     return target, emojis
 
+
 # =========================
-# ХЕЛПЕРЫ
+# ПРОФИЛЬ
 # =========================
+
 async def show_profile(message: Message):
-    invited = get_invited_count(message.from_user.id)
-    contest = ("✅ Вы участвуете!" if invited >= INVITES_FOR_CONTEST
-               else f"Нужно ещё {INVITES_FOR_CONTEST - invited}")
+    invited = get_invited_count(message.chat.id)
+
+    contest = (
+        "✅ Вы участвуете!"
+        if invited >= INVITES_FOR_CONTEST
+        else f"Нужно ещё {INVITES_FOR_CONTEST - invited}"
+    )
+
     await message.answer(
         f"👤 <b>Ваш профиль</b>\n\n"
         f"{progress_bar(invited)}\n"
         f"🏆 Конкурс (от {INVITES_FOR_CONTEST} чел.): {contest}\n"
-        f"🎁 Награда за конкурс: <a href='{NFT_LINK}'>NFT MythMask</a>\n\n"
+        f"🎁 Награда за конкурс: "
+        f"<a href='{NFT_LINK}'>NFT MythMask</a>\n\n"
         f"🔗 Ваша ссылка — кнопка «Моя ссылка».",
         reply_markup=main_menu_kb(),
-        parse_mode="HTML",
         disable_web_page_preview=True
     )
 
+
+# =========================
+# START
+# =========================
+
 async def start_command(message: Message):
     user_id = message.from_user.id
-    u = get_user(user_id) or ensure_user(user_id, message.from_user.username or "")
+
+    u = get_user(user_id) or ensure_user(
+        user_id,
+        message.from_user.username or ""
+    )
 
     if not u["captcha_ok"]:
         target, emojis = generate_captcha()
         captcha_targets[user_id] = target
+
         await message.answer(
             f"🐾 <b>Подтвердите, что вы человек</b>\n\n"
             f"Выберите животное: <b>{target}</b>",
-            reply_markup=captcha_kb(emojis),
-            parse_mode="HTML"
+            reply_markup=captcha_kb(emojis)
         )
+
         return
 
     if not u["joined_channel"]:
@@ -151,76 +227,124 @@ async def start_command(message: Message):
             "📢 Чтобы получать награды, подайте заявку в канал:",
             reply_markup=channel_join_kb()
         )
+
         return
 
     await show_profile(message)
 
+
 # =========================
 # ПОЛЬЗОВАТЕЛЬСКИЙ РОУТЕР
 # =========================
+
 user_router = Router()
+
 
 @user_router.message(CommandStart(deep_link=True))
 async def start_with_ref(message: Message, command: CommandObject):
     user_id = message.from_user.id
+
     referrer_id = None
+
     if command.args and command.args.isdigit():
         referrer_id = int(command.args)
+
         if referrer_id == user_id:
-            await message.answer("❌ Нельзя перейти по своей же ссылке.")
+            await message.answer(
+                "❌ Нельзя перейти по своей же ссылке."
+            )
             return
 
     existed = user_id in users
-    ensure_user(user_id, message.from_user.username or "", referrer_id)
+
+    ensure_user(
+        user_id,
+        message.from_user.username or "",
+        referrer_id
+    )
+
     if not existed and referrer_id:
-        await message.answer("✅ Вы перешли по реферальной ссылке.")
+        await message.answer(
+            "✅ Вы перешли по реферальной ссылке."
+        )
 
     await start_command(message)
+
 
 @user_router.message(CommandStart())
 async def start_plain(message: Message):
-    ensure_user(message.from_user.id, message.from_user.username or "")
+    ensure_user(
+        message.from_user.id,
+        message.from_user.username or ""
+    )
+
     await start_command(message)
+
+
+# =========================
+# ОБРАБОТКА КАПЧИ
+# =========================
 
 @user_router.callback_query(F.data.startswith("cap:"))
 async def captcha_handler(cq: CallbackQuery):
     user_id = cq.from_user.id
+
     chosen = cq.data.split(":", 1)[1]
     target = captcha_targets.get(user_id)
 
     if not target:
-        await cq.answer("Капча устарела. Нажмите /start", show_alert=True)
-        return
-
-    if chosen != target:
-        await cq.answer("❌ Неверно. Попробуйте ещё раз.", show_alert=True)
-        new_target, emojis = generate_captcha()
-        captcha_targets[user_id] = new_target
-        await cq.message.edit_text(
-            f"🐾 <b>Подтвердите, что вы человек</b>\n\n"
-            f"Выберите животное: <b>{new_target}</b>",
-            reply_markup=captcha_kb(emojis),
-            parse_mode="HTML"
+        await cq.answer(
+            "Капча устарела. Нажмите /start",
+            show_alert=True
         )
         return
 
-    u = get_user(user_id) or ensure_user(user_id, cq.from_user.username or "")
-    already_rewarded = bool(u["captcha_ok"] and u["joined_channel"])
+    if chosen != target:
+        await cq.answer(
+            "❌ Неверно. Попробуйте ещё раз.",
+            show_alert=True
+        )
+
+        new_target, emojis = generate_captcha()
+        captcha_targets[user_id] = new_target
+
+        await cq.message.edit_text(
+            f"🐾 <b>Подтвердите, что вы человек</b>\n\n"
+            f"Выберите животное: <b>{new_target}</b>",
+            reply_markup=captcha_kb(emojis)
+        )
+
+        return
+
+    u = get_user(user_id) or ensure_user(
+        user_id,
+        cq.from_user.username or ""
+    )
+
+    already_rewarded = bool(
+        u["captcha_ok"] and u["joined_channel"]
+    )
+
     referrer_id = u["referrer_id"]
 
     await cq.answer("✅ Капча пройдена!")
+
     u["captcha_ok"] = True
+
     captcha_targets.pop(user_id, None)
 
     if referrer_id and not already_rewarded and referrer_id in users:
         users[referrer_id]["invited_count"] += 1
+
         try:
             cnt = users[referrer_id]["invited_count"]
+
             await cq.bot.send_message(
                 referrer_id,
                 f"🎉 По вашей ссылке пришёл новый участник!\n"
                 f"{progress_bar(cnt)}"
             )
+
         except Exception:
             pass
 
@@ -230,73 +354,221 @@ async def captcha_handler(cq: CallbackQuery):
         reply_markup=channel_join_kb()
     )
 
+
+# =========================
+# АВТОПРИНЯТИЕ ЗАЯВОК
+# =========================
+
+@user_router.chat_join_request()
+async def auto_approve_request(event: ChatJoinRequest):
+    user_id = event.from_user.id
+    chat_id = event.chat.id
+
+    # Проверяем, что заявка пришла именно в нужный канал
+    if chat_id != CHANNEL_ID:
+        return
+
+    u = get_user(user_id)
+
+    # Не принимаем заявки пользователей,
+    # которые не прошли капчу в боте.
+    if not u or not u["captcha_ok"]:
+        try:
+            await event.bot.decline_chat_join_request(
+                chat_id=chat_id,
+                user_id=user_id
+            )
+        except Exception:
+            pass
+
+        return
+
+    try:
+        # Автоматически принимаем заявку
+        await event.bot.approve_chat_join_request(
+            chat_id=chat_id,
+            user_id=user_id
+        )
+
+        # Обновляем данные пользователя
+        u["joined_channel"] = True
+
+        u["username"] = (
+            event.from_user.username or u["username"]
+        )
+
+        # Уведомляем пользователя
+        try:
+            await event.bot.send_message(
+                user_id,
+                "🎉 <b>Ваша заявка автоматически одобрена!</b>\n\n"
+                "✅ Вы успешно вступили в канал.\n"
+                "👤 Теперь вам доступен профиль.",
+            )
+
+            await event.bot.send_message(
+                user_id,
+                f"👤 <b>Ваш профиль</b>\n\n"
+                f"{progress_bar(u['invited_count'])}\n"
+                f"🏆 Конкурс (от {INVITES_FOR_CONTEST} чел.): "
+                f"{'✅ Вы участвуете!' if u['invited_count'] >= INVITES_FOR_CONTEST else f'Нужно ещё {INVITES_FOR_CONTEST - u['invited_count']}'}\n"
+                f"🎁 Награда: <a href='{NFT_LINK}'>NFT MythMask</a>\n\n"
+                f"🔗 Ваша ссылка — кнопка «Моя ссылка».",
+                reply_markup=main_menu_kb(),
+                disable_web_page_preview=True
+            )
+
+        except Exception:
+            pass
+
+    except Exception as e:
+        print(
+            f"Ошибка автоматического принятия заявки "
+            f"{user_id}: {e}"
+        )
+
+
+# =========================
+# РУЧНАЯ ПРОВЕРКА ПОДПИСКИ
+# =========================
+
 @user_router.callback_query(F.data == "check_join")
 async def check_join_handler(cq: CallbackQuery):
     user_id = cq.from_user.id
+
     try:
-        member = await cq.bot.get_chat_member(CHANNEL_ID, user_id)
+        member = await cq.bot.get_chat_member(
+            CHANNEL_ID,
+            user_id
+        )
+
         status = member.status
+
     except Exception:
         await cq.answer(
-            "❌ Не удалось проверить. Убедитесь, что заявка подана и бот админ в канале.",
+            "❌ Не удалось проверить подписку.",
             show_alert=True
         )
         return
 
     if status in ("member", "administrator", "creator"):
-        u = get_user(user_id) or ensure_user(user_id, cq.from_user.username or "")
+        u = get_user(user_id) or ensure_user(
+            user_id,
+            cq.from_user.username or ""
+        )
+
         u["joined_channel"] = True
-        await cq.message.edit_text("✅ Подписка подтверждена! Добро пожаловать.")
+
+        await cq.answer("✅ Подписка подтверждена!")
+
+        await cq.message.edit_text(
+            "✅ Подписка подтверждена! Добро пожаловать."
+        )
+
         await show_profile(cq.message)
+
     else:
-        await cq.answer("❌ Вы ещё не подписаны или заявка не одобрена.", show_alert=True)
+        await cq.answer(
+            "⏳ Заявка ещё не одобрена. Попробуйте немного позже.",
+            show_alert=True
+        )
+
+
+# =========================
+# РЕФЕРАЛЬНАЯ ССЫЛКА
+# =========================
 
 @user_router.message(F.text == "🔗 Моя ссылка")
 async def my_link(message: Message):
-    ensure_user(message.from_user.id, message.from_user.username or "")
-    link = await create_start_link(message.bot, str(message.from_user.id), encode=True)
+    ensure_user(
+        message.from_user.id,
+        message.from_user.username or ""
+    )
+
+    link = await create_start_link(
+        message.bot,
+        str(message.from_user.id),
+        encode=True
+    )
+
     invited = get_invited_count(message.from_user.id)
+
     await message.answer(
         f"🔗 <b>Ваша реферальная ссылка:</b>\n\n"
         f"<code>{link}</code>\n\n"
         f"{progress_bar(invited)}\n"
-        f"Скопируйте ссылку и отправьте другу.",
-        parse_mode="HTML"
+        f"Скопируйте ссылку и отправьте другу."
     )
+
+
+# =========================
+# ПРОФИЛЬ
+# =========================
 
 @user_router.message(F.text == "👤 Профиль")
 async def profile_btn(message: Message):
-    ensure_user(message.from_user.id, message.from_user.username or "")
+    ensure_user(
+        message.from_user.id,
+        message.from_user.username or ""
+    )
+
     await show_profile(message)
+
+
+# =========================
+# КОНКУРС
+# =========================
 
 @user_router.message(F.text == "🏆 Конкурс")
 async def contest_btn(message: Message):
     invited = get_invited_count(message.from_user.id)
+
     await message.answer(
         f"🏆 <b>Конкурс</b>\n\n"
         f"Нужно пригласить <b>{INVITES_FOR_CONTEST}</b> человек.\n"
         f"У вас: <b>{invited}</b>\n"
         f"{progress_bar(invited)}\n\n"
         f"🎁 Победитель получает NFT: {NFT_LINK}\n\n"
-        f"📹 Если приглашённый купит любое видео в канале — ваш шанс +50%.",
-        parse_mode="HTML",
+        f"📹 Если приглашённый купит любое видео в канале — "
+        f"ваш шанс +50%.",
         disable_web_page_preview=True
     )
+
 
 # =========================
 # АДМИНСКИЙ РОУТЕР
 # =========================
+
 admin_router = Router()
-admin_router.message.filter(F.from_user.id == ADMIN_ID)
+admin_router.message.filter(
+    F.from_user.id == ADMIN_ID
+)
+
 
 @admin_router.message(Command("stat"))
 async def stat_handler(message: Message):
     total = len(users)
-    captcha = sum(1 for u in users.values() if u["captcha_ok"])
-    joined = sum(1 for u in users.values() if u["joined_channel"])
-    purchased = sum(1 for u in users.values() if u["purchased_video"])
 
-    top = sorted(users.items(), key=lambda kv: kv[1]["invited_count"], reverse=True)[:10]
+    captcha = sum(
+        1 for u in users.values()
+        if u["captcha_ok"]
+    )
+
+    joined = sum(
+        1 for u in users.values()
+        if u["joined_channel"]
+    )
+
+    purchased = sum(
+        1 for u in users.values()
+        if u["purchased_video"]
+    )
+
+    top = sorted(
+        users.items(),
+        key=lambda kv: kv[1]["invited_count"],
+        reverse=True
+    )[:10]
 
     text = (
         f"📊 <b>Статистика</b>\n\n"
@@ -306,50 +578,99 @@ async def stat_handler(message: Message):
         f"📹 Купили видео: {purchased}\n\n"
         f"🏆 <b>Топ-10 по приглашениям:</b>\n"
     )
-    for uid, u in top:
-        name = f"@{u['username']}" if u["username"] else str(uid)
-        marker = " ✅" if u["invited_count"] >= INVITES_FOR_CONTEST else ""
-        text += f"{name} — {u['invited_count']}{marker}\n"
 
-    await message.answer(text, parse_mode="HTML")
+    for uid, u in top:
+        name = (
+            f"@{u['username']}"
+            if u["username"]
+            else str(uid)
+        )
+
+        marker = (
+            " ✅"
+            if u["invited_count"] >= INVITES_FOR_CONTEST
+            else ""
+        )
+
+        text += (
+            f"{name} — {u['invited_count']}{marker}\n"
+        )
+
+    await message.answer(text)
+
+
+# =========================
+# РАССЫЛКА
+# =========================
 
 @admin_router.message(Command("m"))
 async def broadcast_handler(message: Message):
     if message.reply_to_message:
-        text = message.reply_to_message.text or message.reply_to_message.caption or ""
+        text = (
+            message.reply_to_message.text
+            or message.reply_to_message.caption
+            or ""
+        )
+
     else:
         parts = message.text.split(maxsplit=1)
+
         if len(parts) < 2:
-            await message.answer("Использование: /m текст, или ответьте на сообщение командой /m")
+            await message.answer(
+                "Использование: /m текст, "
+                "или ответьте на сообщение командой /m"
+            )
             return
+
         text = parts[1]
 
     if not text:
         await message.answer("Пустое сообщение.")
         return
 
-    sent = failed = 0
+    sent = 0
+    failed = 0
+
     for uid in list(users.keys()):
         try:
             await message.bot.send_message(uid, text)
             sent += 1
+
         except Exception:
             failed += 1
 
-    await message.answer(f"📨 Рассылка завершена.\n✅ Отправлено: {sent}\n❌ Ошибок: {failed}")
+    await message.answer(
+        f"📨 Рассылка завершена.\n"
+        f"✅ Отправлено: {sent}\n"
+        f"❌ Ошибок: {failed}"
+    )
+
 
 # =========================
 # ЗАПУСК
 # =========================
+
 async def main():
     bot = Bot(
         token=BOT_TOKEN,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+        default=DefaultBotProperties(
+            parse_mode=ParseMode.HTML
+        )
     )
+
     dp = Dispatcher()
+
     dp.include_router(admin_router)
     dp.include_router(user_router)
-    await dp.start_polling(bot)
+
+    print("🤖 Бот запущен!")
+    print(f"📢 CHANNEL_ID: {CHANNEL_ID}")
+    print("✅ Автоматическое принятие заявок включено.")
+
+    await dp.start_polling(
+        bot,
+        allowed_updates=dp.resolve_used_update_types()
+    )
 
 
 if __name__ == "__main__":

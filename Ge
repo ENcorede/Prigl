@@ -1,16 +1,14 @@
-# bot.py — единый файл Telegram-бота
-# Установка: pip install aiogram==3.13.1 aiosqlite==0.20.0
-# Запуск: python bot.py
+# bot.py — единый файл, БЕЗ базы данных (всё в памяти, сбрасывается при перезапуске)
+# pip install aiogram==3.13.1
 #
-# Переменные окружения (хост прокидывает сам):
+# Переменные окружения:
 #   BOT_TOKEN / TELEGRAM_BOT_TOKEN / TELEGRAM_TOKEN / TOKEN / API_TOKEN — токен
 #   CHANNEL_ID — числовой ID канала (бот должен быть админом!)
-#   CHANNEL_LINK, ADMIN_ID, INVITES_FOR_CONTEST, NFT_LINK, DB_PATH — опционально
+#   CHANNEL_LINK, ADMIN_ID, INVITES_FOR_CONTEST, NFT_LINK — опционально
 
 import os
 import asyncio
 import random
-import aiosqlite
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.filters import CommandStart, Command, CommandObject
 from aiogram.types import (
@@ -36,82 +34,45 @@ BOT_TOKEN = _get_env(
     "BOT_TOKEN", "TELEGRAM_BOT_TOKEN", "TELEGRAM_TOKEN", "TOKEN", "API_TOKEN"
 )
 if not BOT_TOKEN:
-    raise RuntimeError(
-        "Не найдена переменная окружения с токеном бота. "
-        "Ожидается BOT_TOKEN / TELEGRAM_BOT_TOKEN / TELEGRAM_TOKEN / TOKEN / API_TOKEN."
-    )
+    raise RuntimeError("Не найден токен в переменных окружения.")
 
 CHANNEL_ID = int(_get_env("CHANNEL_ID", "TG_CHANNEL_ID", default="-1001234567890"))
 CHANNEL_LINK = os.getenv("CHANNEL_LINK", "https://t.me/+8ZzwtRJ6xDlmZWMx")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "8332196726"))
 INVITES_FOR_CONTEST = int(os.getenv("INVITES_FOR_CONTEST", "15"))
 NFT_LINK = os.getenv("NFT_LINK", "https://t.me/nft/MythMask-166243")
-DB_PATH = os.getenv("DB_PATH", "bot.db")
 
 ANIMALS = ["🐺","🐻","🐻‍❄️","🐶","🐱","🦁","🐯","🐭","🦊","🐗","🐢","🐴","🐸","🐊"]
 
 # =========================
-# БАЗА ДАННЫХ
+# ХРАНИЛИЩЕ В ПАМЯТИ
 # =========================
-async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id         INTEGER PRIMARY KEY,
-            username        TEXT,
-            referrer_id     INTEGER,
-            captcha_ok      INTEGER DEFAULT 0,
-            joined_channel  INTEGER DEFAULT 0,
-            purchased_video INTEGER DEFAULT 0,
-            invited_count   INTEGER DEFAULT 0,
-            created_at      TEXT DEFAULT CURRENT_TIMESTAMP
-        )""")
-        await db.commit()
+# user_id -> {"username": str, "referrer_id": int|None,
+#             "captcha_ok": bool, "joined_channel": bool,
+#             "purchased_video": bool, "invited_count": int}
+users: dict[int, dict] = {}
+captcha_targets: dict[int, str] = {}
 
-async def get_user(user_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
-        return await cur.fetchone()
+def get_user(user_id: int):
+    return users.get(user_id)
 
-async def create_user(user_id: int, username: str, referrer_id):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT OR IGNORE INTO users (user_id, username, referrer_id) VALUES (?,?,?)",
-            (user_id, username, referrer_id)
-        )
-        await db.commit()
+def ensure_user(user_id: int, username: str, referrer_id=None):
+    if user_id not in users:
+        users[user_id] = {
+            "username": username or "",
+            "referrer_id": referrer_id,
+            "captcha_ok": False,
+            "joined_channel": False,
+            "purchased_video": False,
+            "invited_count": 0,
+        }
+    elif referrer_id and users[user_id]["referrer_id"] is None:
+        users[user_id]["referrer_id"] = referrer_id
+    return users[user_id]
 
-async def set_referrer_if_empty(user_id: int, referrer_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE users SET referrer_id=? WHERE user_id=? AND referrer_id IS NULL",
-            (referrer_id, user_id)
-        )
-        await db.commit()
-
-async def set_captcha_ok(user_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE users SET captcha_ok=1 WHERE user_id=?", (user_id,))
-        await db.commit()
-
-async def set_joined_channel(user_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE users SET joined_channel=1 WHERE user_id=?", (user_id,))
-        await db.commit()
-
-async def add_invite(referrer_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "UPDATE users SET invited_count = invited_count + 1 WHERE user_id=?",
-            (referrer_id,)
-        )
-        await db.commit()
-
-async def get_invited_count(user_id: int) -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT invited_count FROM users WHERE user_id=?", (user_id,))
-        row = await cur.fetchone()
-        return row[0] if row else 0
+def get_invited_count(user_id: int) -> int:
+    u = users.get(user_id)
+    return u["invited_count"] if u else 0
 
 # =========================
 # КЛАВИАТУРЫ
@@ -152,13 +113,11 @@ def generate_captcha():
     random.shuffle(emojis)
     return target, emojis
 
-captcha_targets: dict[int, str] = {}
-
 # =========================
 # ХЕЛПЕРЫ
 # =========================
 async def show_profile(message: Message):
-    invited = await get_invited_count(message.from_user.id)
+    invited = get_invited_count(message.from_user.id)
     contest = ("✅ Вы участвуете!" if invited >= INVITES_FOR_CONTEST
                else f"Нужно ещё {INVITES_FOR_CONTEST - invited}")
     await message.answer(
@@ -174,15 +133,9 @@ async def show_profile(message: Message):
 
 async def start_command(message: Message):
     user_id = message.from_user.id
-    user = await get_user(user_id)
-    if not user:
-        await create_user(user_id, message.from_user.username or "", None)
-        user = await get_user(user_id)
+    u = get_user(user_id) or ensure_user(user_id, message.from_user.username or "")
 
-    captcha_ok = user[3]
-    joined = user[4]
-
-    if not captcha_ok:
+    if not u["captcha_ok"]:
         target, emojis = generate_captcha()
         captcha_targets[user_id] = target
         await message.answer(
@@ -193,7 +146,7 @@ async def start_command(message: Message):
         )
         return
 
-    if not joined:
+    if not u["joined_channel"]:
         await message.answer(
             "📢 Чтобы получать награды, подайте заявку в канал:",
             reply_markup=channel_join_kb()
@@ -217,19 +170,16 @@ async def start_with_ref(message: Message, command: CommandObject):
             await message.answer("❌ Нельзя перейти по своей же ссылке.")
             return
 
-    user = await get_user(user_id)
-    if not user:
-        await create_user(user_id, message.from_user.username or "", referrer_id)
-        if referrer_id:
-            await message.answer("✅ Вы перешли по реферальной ссылке.")
-    else:
-        if referrer_id:
-            await set_referrer_if_empty(user_id, referrer_id)
+    existed = user_id in users
+    ensure_user(user_id, message.from_user.username or "", referrer_id)
+    if not existed and referrer_id:
+        await message.answer("✅ Вы перешли по реферальной ссылке.")
 
     await start_command(message)
 
 @user_router.message(CommandStart())
 async def start_plain(message: Message):
+    ensure_user(message.from_user.id, message.from_user.username or "")
     await start_command(message)
 
 @user_router.callback_query(F.data.startswith("cap:"))
@@ -254,18 +204,18 @@ async def captcha_handler(cq: CallbackQuery):
         )
         return
 
-    user_before = await get_user(user_id)
-    already_rewarded = bool(user_before and user_before[3] == 1 and user_before[4] == 1)
-    referrer_id = user_before[2] if user_before else None
+    u = get_user(user_id) or ensure_user(user_id, cq.from_user.username or "")
+    already_rewarded = bool(u["captcha_ok"] and u["joined_channel"])
+    referrer_id = u["referrer_id"]
 
     await cq.answer("✅ Капча пройдена!")
-    await set_captcha_ok(user_id)
+    u["captcha_ok"] = True
     captcha_targets.pop(user_id, None)
 
-    if referrer_id and not already_rewarded:
-        await add_invite(referrer_id)
+    if referrer_id and not already_rewarded and referrer_id in users:
+        users[referrer_id]["invited_count"] += 1
         try:
-            cnt = await get_invited_count(referrer_id)
+            cnt = users[referrer_id]["invited_count"]
             await cq.bot.send_message(
                 referrer_id,
                 f"🎉 По вашей ссылке пришёл новый участник!\n"
@@ -294,7 +244,8 @@ async def check_join_handler(cq: CallbackQuery):
         return
 
     if status in ("member", "administrator", "creator"):
-        await set_joined_channel(user_id)
+        u = get_user(user_id) or ensure_user(user_id, cq.from_user.username or "")
+        u["joined_channel"] = True
         await cq.message.edit_text("✅ Подписка подтверждена! Добро пожаловать.")
         await show_profile(cq.message)
     else:
@@ -302,8 +253,9 @@ async def check_join_handler(cq: CallbackQuery):
 
 @user_router.message(F.text == "🔗 Моя ссылка")
 async def my_link(message: Message):
+    ensure_user(message.from_user.id, message.from_user.username or "")
     link = await create_start_link(message.bot, str(message.from_user.id), encode=True)
-    invited = await get_invited_count(message.from_user.id)
+    invited = get_invited_count(message.from_user.id)
     await message.answer(
         f"🔗 <b>Ваша реферальная ссылка:</b>\n\n"
         f"<code>{link}</code>\n\n"
@@ -314,11 +266,12 @@ async def my_link(message: Message):
 
 @user_router.message(F.text == "👤 Профиль")
 async def profile_btn(message: Message):
+    ensure_user(message.from_user.id, message.from_user.username or "")
     await show_profile(message)
 
 @user_router.message(F.text == "🏆 Конкурс")
 async def contest_btn(message: Message):
-    invited = await get_invited_count(message.from_user.id)
+    invited = get_invited_count(message.from_user.id)
     await message.answer(
         f"🏆 <b>Конкурс</b>\n\n"
         f"Нужно пригласить <b>{INVITES_FOR_CONTEST}</b> человек.\n"
@@ -338,20 +291,12 @@ admin_router.message.filter(F.from_user.id == ADMIN_ID)
 
 @admin_router.message(Command("stat"))
 async def stat_handler(message: Message):
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT COUNT(*) FROM users") as cur:
-            total = (await cur.fetchone())[0]
-        async with db.execute("SELECT COUNT(*) FROM users WHERE captcha_ok=1") as cur:
-            captcha = (await cur.fetchone())[0]
-        async with db.execute("SELECT COUNT(*) FROM users WHERE joined_channel=1") as cur:
-            joined = (await cur.fetchone())[0]
-        async with db.execute("SELECT COUNT(*) FROM users WHERE purchased_video=1") as cur:
-            purchased = (await cur.fetchone())[0]
-        async with db.execute(
-            "SELECT user_id, username, invited_count FROM users "
-            "ORDER BY invited_count DESC LIMIT 10"
-        ) as cur:
-            top = await cur.fetchall()
+    total = len(users)
+    captcha = sum(1 for u in users.values() if u["captcha_ok"])
+    joined = sum(1 for u in users.values() if u["joined_channel"])
+    purchased = sum(1 for u in users.values() if u["purchased_video"])
+
+    top = sorted(users.items(), key=lambda kv: kv[1]["invited_count"], reverse=True)[:10]
 
     text = (
         f"📊 <b>Статистика</b>\n\n"
@@ -361,10 +306,10 @@ async def stat_handler(message: Message):
         f"📹 Купили видео: {purchased}\n\n"
         f"🏆 <b>Топ-10 по приглашениям:</b>\n"
     )
-    for uid, uname, cnt in top:
-        name = f"@{uname}" if uname else str(uid)
-        marker = " ✅" if cnt >= INVITES_FOR_CONTEST else ""
-        text += f"{name} — {cnt}{marker}\n"
+    for uid, u in top:
+        name = f"@{u['username']}" if u["username"] else str(uid)
+        marker = " ✅" if u["invited_count"] >= INVITES_FOR_CONTEST else ""
+        text += f"{name} — {u['invited_count']}{marker}\n"
 
     await message.answer(text, parse_mode="HTML")
 
@@ -383,12 +328,8 @@ async def broadcast_handler(message: Message):
         await message.answer("Пустое сообщение.")
         return
 
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT user_id FROM users") as cur:
-            users = await cur.fetchall()
-
     sent = failed = 0
-    for (uid,) in users:
+    for uid in list(users.keys()):
         try:
             await message.bot.send_message(uid, text)
             sent += 1
@@ -401,7 +342,6 @@ async def broadcast_handler(message: Message):
 # ЗАПУСК
 # =========================
 async def main():
-    await init_db()
     bot = Bot(
         token=BOT_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML)

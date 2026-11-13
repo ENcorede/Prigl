@@ -1,0 +1,416 @@
+# bot.py — единый файл Telegram-бота
+# Установка: pip install aiogram==3.13.1 aiosqlite==0.20.0
+# Запуск: python bot.py
+#
+# Переменные окружения (хост прокидывает сам):
+#   BOT_TOKEN / TELEGRAM_BOT_TOKEN / TELEGRAM_TOKEN / TOKEN / API_TOKEN — токен
+#   CHANNEL_ID — числовой ID канала (бот должен быть админом!)
+#   CHANNEL_LINK, ADMIN_ID, INVITES_FOR_CONTEST, NFT_LINK, DB_PATH — опционально
+
+import os
+import asyncio
+import random
+import aiosqlite
+from aiogram import Bot, Dispatcher, Router, F
+from aiogram.filters import CommandStart, Command, CommandObject
+from aiogram.types import (
+    Message, CallbackQuery,
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    ReplyKeyboardMarkup, KeyboardButton
+)
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.utils.deep_linking import create_start_link
+
+# =========================
+# НАСТРОЙКИ
+# =========================
+def _get_env(*names, default=None):
+    for n in names:
+        v = os.getenv(n)
+        if v:
+            return v
+    return default
+
+BOT_TOKEN = _get_env(
+    "BOT_TOKEN", "TELEGRAM_BOT_TOKEN", "TELEGRAM_TOKEN", "TOKEN", "API_TOKEN"
+)
+if not BOT_TOKEN:
+    raise RuntimeError(
+        "Не найдена переменная окружения с токеном бота. "
+        "Ожидается BOT_TOKEN / TELEGRAM_BOT_TOKEN / TELEGRAM_TOKEN / TOKEN / API_TOKEN."
+    )
+
+CHANNEL_ID = int(_get_env("CHANNEL_ID", "TG_CHANNEL_ID", default="-1001234567890"))
+CHANNEL_LINK = os.getenv("CHANNEL_LINK", "https://t.me/+8ZzwtRJ6xDlmZWMx")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "8332196726"))
+INVITES_FOR_CONTEST = int(os.getenv("INVITES_FOR_CONTEST", "15"))
+NFT_LINK = os.getenv("NFT_LINK", "https://t.me/nft/MythMask-166243")
+DB_PATH = os.getenv("DB_PATH", "bot.db")
+
+ANIMALS = ["🐺","🐻","🐻‍❄️","🐶","🐱","🦁","🐯","🐭","🦊","🐗","🐢","🐴","🐸","🐊"]
+
+# =========================
+# БАЗА ДАННЫХ
+# =========================
+async def init_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id         INTEGER PRIMARY KEY,
+            username        TEXT,
+            referrer_id     INTEGER,
+            captcha_ok      INTEGER DEFAULT 0,
+            joined_channel  INTEGER DEFAULT 0,
+            purchased_video INTEGER DEFAULT 0,
+            invited_count   INTEGER DEFAULT 0,
+            created_at      TEXT DEFAULT CURRENT_TIMESTAMP
+        )""")
+        await db.commit()
+
+async def get_user(user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
+        return await cur.fetchone()
+
+async def create_user(user_id: int, username: str, referrer_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO users (user_id, username, referrer_id) VALUES (?,?,?)",
+            (user_id, username, referrer_id)
+        )
+        await db.commit()
+
+async def set_referrer_if_empty(user_id: int, referrer_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE users SET referrer_id=? WHERE user_id=? AND referrer_id IS NULL",
+            (referrer_id, user_id)
+        )
+        await db.commit()
+
+async def set_captcha_ok(user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET captcha_ok=1 WHERE user_id=?", (user_id,))
+        await db.commit()
+
+async def set_joined_channel(user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET joined_channel=1 WHERE user_id=?", (user_id,))
+        await db.commit()
+
+async def add_invite(referrer_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE users SET invited_count = invited_count + 1 WHERE user_id=?",
+            (referrer_id,)
+        )
+        await db.commit()
+
+async def get_invited_count(user_id: int) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT invited_count FROM users WHERE user_id=?", (user_id,))
+        row = await cur.fetchone()
+        return row[0] if row else 0
+
+# =========================
+# КЛАВИАТУРЫ
+# =========================
+def progress_bar(current: int, total: int = 5) -> str:
+    filled = "▓" * min(current, total)
+    empty = "░" * max(0, total - current)
+    return f"│{filled}{empty}│ {current}/{total} приглашено"
+
+def main_menu_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="👤 Профиль")],
+            [KeyboardButton(text="🔗 Моя ссылка")],
+            [KeyboardButton(text="🏆 Конкурс")],
+        ],
+        resize_keyboard=True
+    )
+
+def captcha_kb(emojis: list[str]) -> InlineKeyboardMarkup:
+    buttons = [InlineKeyboardButton(text=e, callback_data=f"cap:{e}") for e in emojis]
+    rows = [buttons[i:i+3] for i in range(0, len(buttons), 3)]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def channel_join_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📢 Подать заявку в канал", url=CHANNEL_LINK)],
+        [InlineKeyboardButton(text="✅ Я подал заявку", callback_data="check_join")]
+    ])
+
+# =========================
+# КАПЧА
+# =========================
+def generate_captcha():
+    target = random.choice(ANIMALS)
+    others = random.sample([e for e in ANIMALS if e != target], 8)
+    emojis = [target] + others
+    random.shuffle(emojis)
+    return target, emojis
+
+captcha_targets: dict[int, str] = {}
+
+# =========================
+# ХЕЛПЕРЫ
+# =========================
+async def show_profile(message: Message):
+    invited = await get_invited_count(message.from_user.id)
+    contest = ("✅ Вы участвуете!" if invited >= INVITES_FOR_CONTEST
+               else f"Нужно ещё {INVITES_FOR_CONTEST - invited}")
+    await message.answer(
+        f"👤 <b>Ваш профиль</b>\n\n"
+        f"{progress_bar(invited)}\n"
+        f"🏆 Конкурс (от {INVITES_FOR_CONTEST} чел.): {contest}\n"
+        f"🎁 Награда за конкурс: <a href='{NFT_LINK}'>NFT MythMask</a>\n\n"
+        f"🔗 Ваша ссылка — кнопка «Моя ссылка».",
+        reply_markup=main_menu_kb(),
+        parse_mode="HTML",
+        disable_web_page_preview=True
+    )
+
+async def start_command(message: Message):
+    user_id = message.from_user.id
+    user = await get_user(user_id)
+    if not user:
+        await create_user(user_id, message.from_user.username or "", None)
+        user = await get_user(user_id)
+
+    captcha_ok = user[3]
+    joined = user[4]
+
+    if not captcha_ok:
+        target, emojis = generate_captcha()
+        captcha_targets[user_id] = target
+        await message.answer(
+            f"🐾 <b>Подтвердите, что вы человек</b>\n\n"
+            f"Выберите животное: <b>{target}</b>",
+            reply_markup=captcha_kb(emojis),
+            parse_mode="HTML"
+        )
+        return
+
+    if not joined:
+        await message.answer(
+            "📢 Чтобы получать награды, подайте заявку в канал:",
+            reply_markup=channel_join_kb()
+        )
+        return
+
+    await show_profile(message)
+
+# =========================
+# ПОЛЬЗОВАТЕЛЬСКИЙ РОУТЕР
+# =========================
+user_router = Router()
+
+@user_router.message(CommandStart(deep_link=True))
+async def start_with_ref(message: Message, command: CommandObject):
+    user_id = message.from_user.id
+    referrer_id = None
+    if command.args and command.args.isdigit():
+        referrer_id = int(command.args)
+        if referrer_id == user_id:
+            await message.answer("❌ Нельзя перейти по своей же ссылке.")
+            return
+
+    user = await get_user(user_id)
+    if not user:
+        await create_user(user_id, message.from_user.username or "", referrer_id)
+        if referrer_id:
+            await message.answer("✅ Вы перешли по реферальной ссылке.")
+    else:
+        if referrer_id:
+            await set_referrer_if_empty(user_id, referrer_id)
+
+    await start_command(message)
+
+@user_router.message(CommandStart())
+async def start_plain(message: Message):
+    await start_command(message)
+
+@user_router.callback_query(F.data.startswith("cap:"))
+async def captcha_handler(cq: CallbackQuery):
+    user_id = cq.from_user.id
+    chosen = cq.data.split(":", 1)[1]
+    target = captcha_targets.get(user_id)
+
+    if not target:
+        await cq.answer("Капча устарела. Нажмите /start", show_alert=True)
+        return
+
+    if chosen != target:
+        await cq.answer("❌ Неверно. Попробуйте ещё раз.", show_alert=True)
+        new_target, emojis = generate_captcha()
+        captcha_targets[user_id] = new_target
+        await cq.message.edit_text(
+            f"🐾 <b>Подтвердите, что вы человек</b>\n\n"
+            f"Выберите животное: <b>{new_target}</b>",
+            reply_markup=captcha_kb(emojis),
+            parse_mode="HTML"
+        )
+        return
+
+    user_before = await get_user(user_id)
+    already_rewarded = bool(user_before and user_before[3] == 1 and user_before[4] == 1)
+    referrer_id = user_before[2] if user_before else None
+
+    await cq.answer("✅ Капча пройдена!")
+    await set_captcha_ok(user_id)
+    captcha_targets.pop(user_id, None)
+
+    if referrer_id and not already_rewarded:
+        await add_invite(referrer_id)
+        try:
+            cnt = await get_invited_count(referrer_id)
+            await cq.bot.send_message(
+                referrer_id,
+                f"🎉 По вашей ссылке пришёл новый участник!\n"
+                f"{progress_bar(cnt)}"
+            )
+        except Exception:
+            pass
+
+    await cq.message.edit_text(
+        "✅ Капча пройдена!\n\n"
+        "📢 Теперь подайте заявку в канал:",
+        reply_markup=channel_join_kb()
+    )
+
+@user_router.callback_query(F.data == "check_join")
+async def check_join_handler(cq: CallbackQuery):
+    user_id = cq.from_user.id
+    try:
+        member = await cq.bot.get_chat_member(CHANNEL_ID, user_id)
+        status = member.status
+    except Exception:
+        await cq.answer(
+            "❌ Не удалось проверить. Убедитесь, что заявка подана и бот админ в канале.",
+            show_alert=True
+        )
+        return
+
+    if status in ("member", "administrator", "creator"):
+        await set_joined_channel(user_id)
+        await cq.message.edit_text("✅ Подписка подтверждена! Добро пожаловать.")
+        await show_profile(cq.message)
+    else:
+        await cq.answer("❌ Вы ещё не подписаны или заявка не одобрена.", show_alert=True)
+
+@user_router.message(F.text == "🔗 Моя ссылка")
+async def my_link(message: Message):
+    link = await create_start_link(message.bot, str(message.from_user.id), encode=True)
+    invited = await get_invited_count(message.from_user.id)
+    await message.answer(
+        f"🔗 <b>Ваша реферальная ссылка:</b>\n\n"
+        f"<code>{link}</code>\n\n"
+        f"{progress_bar(invited)}\n"
+        f"Скопируйте ссылку и отправьте другу.",
+        parse_mode="HTML"
+    )
+
+@user_router.message(F.text == "👤 Профиль")
+async def profile_btn(message: Message):
+    await show_profile(message)
+
+@user_router.message(F.text == "🏆 Конкурс")
+async def contest_btn(message: Message):
+    invited = await get_invited_count(message.from_user.id)
+    await message.answer(
+        f"🏆 <b>Конкурс</b>\n\n"
+        f"Нужно пригласить <b>{INVITES_FOR_CONTEST}</b> человек.\n"
+        f"У вас: <b>{invited}</b>\n"
+        f"{progress_bar(invited)}\n\n"
+        f"🎁 Победитель получает NFT: {NFT_LINK}\n\n"
+        f"📹 Если приглашённый купит любое видео в канале — ваш шанс +50%.",
+        parse_mode="HTML",
+        disable_web_page_preview=True
+    )
+
+# =========================
+# АДМИНСКИЙ РОУТЕР
+# =========================
+admin_router = Router()
+admin_router.message.filter(F.from_user.id == ADMIN_ID)
+
+@admin_router.message(Command("stat"))
+async def stat_handler(message: Message):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT COUNT(*) FROM users") as cur:
+            total = (await cur.fetchone())[0]
+        async with db.execute("SELECT COUNT(*) FROM users WHERE captcha_ok=1") as cur:
+            captcha = (await cur.fetchone())[0]
+        async with db.execute("SELECT COUNT(*) FROM users WHERE joined_channel=1") as cur:
+            joined = (await cur.fetchone())[0]
+        async with db.execute("SELECT COUNT(*) FROM users WHERE purchased_video=1") as cur:
+            purchased = (await cur.fetchone())[0]
+        async with db.execute(
+            "SELECT user_id, username, invited_count FROM users "
+            "ORDER BY invited_count DESC LIMIT 10"
+        ) as cur:
+            top = await cur.fetchall()
+
+    text = (
+        f"📊 <b>Статистика</b>\n\n"
+        f"👥 Всего пользователей: {total}\n"
+        f"✅ Прошли капчу: {captcha}\n"
+        f"📢 Подтвердили канал: {joined}\n"
+        f"📹 Купили видео: {purchased}\n\n"
+        f"🏆 <b>Топ-10 по приглашениям:</b>\n"
+    )
+    for uid, uname, cnt in top:
+        name = f"@{uname}" if uname else str(uid)
+        marker = " ✅" if cnt >= INVITES_FOR_CONTEST else ""
+        text += f"{name} — {cnt}{marker}\n"
+
+    await message.answer(text, parse_mode="HTML")
+
+@admin_router.message(Command("m"))
+async def broadcast_handler(message: Message):
+    if message.reply_to_message:
+        text = message.reply_to_message.text or message.reply_to_message.caption or ""
+    else:
+        parts = message.text.split(maxsplit=1)
+        if len(parts) < 2:
+            await message.answer("Использование: /m текст, или ответьте на сообщение командой /m")
+            return
+        text = parts[1]
+
+    if not text:
+        await message.answer("Пустое сообщение.")
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT user_id FROM users") as cur:
+            users = await cur.fetchall()
+
+    sent = failed = 0
+    for (uid,) in users:
+        try:
+            await message.bot.send_message(uid, text)
+            sent += 1
+        except Exception:
+            failed += 1
+
+    await message.answer(f"📨 Рассылка завершена.\n✅ Отправлено: {sent}\n❌ Ошибок: {failed}")
+
+# =========================
+# ЗАПУСК
+# =========================
+async def main():
+    await init_db()
+    bot = Bot(
+        token=BOT_TOKEN,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+    )
+    dp = Dispatcher()
+    dp.include_router(admin_router)
+    dp.include_router(user_router)
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

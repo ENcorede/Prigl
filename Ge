@@ -111,18 +111,32 @@ def generate_captcha():
 # =========================
 # ХЕЛПЕРЫ
 # =========================
-async def show_profile(message: Message):
-    invited = get_invited_count(message.from_user.id)
+def profile_text(user_id: int) -> str:
+    invited = get_invited_count(user_id)
     contest = ("✅ Вы участвуете!" if invited >= INVITES_FOR_CONTEST
                else f"Нужно ещё {INVITES_FOR_CONTEST - invited}")
-    await message.answer(
+    return (
         f"👤 <b>Ваш профиль</b>\n\n"
         f"{progress_bar(invited)}\n"
         f"🏆 Конкурс (от {INVITES_FOR_CONTEST} чел.): {contest}\n"
         f"🎁 Награда за конкурс: <a href='{NFT_LINK}'>NFT MythMask</a>\n\n"
-        f"🔗 Ваша ссылка — кнопка «Моя ссылка».",
+        f"🔗 Ваша ссылка — кнопка «Моя ссылка»."
+    )
+
+async def safe_edit(message: Message, text: str, reply_markup=None, parse_mode=None):
+    """Пробует отредактировать сообщение; при ошибке просто игнорирует."""
+    try:
+        await message.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+        return True
+    except Exception:
+        return False
+
+async def send_profile(bot: Bot, chat_id: int, user_id: int):
+    """Гарантированно отправляет профиль с ReplyKeyboard в чат пользователя."""
+    await bot.send_message(
+        chat_id,
+        profile_text(user_id),
         reply_markup=main_menu_kb(),
-        parse_mode="HTML",
         disable_web_page_preview=True
     )
 
@@ -136,8 +150,7 @@ async def start_command(message: Message):
         await message.answer(
             f"🐾 <b>Подтвердите, что вы человек</b>\n\n"
             f"Выберите животное: <b>{target}</b>",
-            reply_markup=captcha_kb(emojis),
-            parse_mode="HTML"
+            reply_markup=captcha_kb(emojis)
         )
         return
 
@@ -148,7 +161,7 @@ async def start_command(message: Message):
         )
         return
 
-    await show_profile(message)
+    await send_profile(message.bot, message.chat.id, user_id)
 
 # =========================
 # ПОЛЬЗОВАТЕЛЬСКИЙ РОУТЕР
@@ -191,21 +204,33 @@ async def captcha_handler(cq: CallbackQuery):
         await cq.answer("❌ Неверно. Попробуйте ещё раз.", show_alert=True)
         new_target, emojis = generate_captcha()
         captcha_targets[user_id] = new_target
-        await cq.message.edit_text(
+        ok = await safe_edit(
+            cq.message,
             f"🐾 <b>Подтвердите, что вы человек</b>\n\n"
             f"Выберите животное: <b>{new_target}</b>",
             reply_markup=captcha_kb(emojis),
             parse_mode="HTML"
         )
+        if not ok:
+            await cq.bot.send_message(
+                cq.from_user.id,
+                f"🐾 <b>Подтвердите, что вы человек</b>\n\n"
+                f"Выберите животное: <b>{new_target}</b>",
+                reply_markup=captcha_kb(emojis)
+            )
         return
 
     u = get_user(user_id) or ensure_user(user_id, cq.from_user.username or "")
     already_rewarded = bool(u["captcha_ok"] and u["joined_channel"])
     referrer_id = u["referrer_id"]
 
-    await cq.answer("✅ Капча пройдена!")
     u["captcha_ok"] = True
     captcha_targets.pop(user_id, None)
+
+    try:
+        await cq.answer("✅ Капча пройдена!")
+    except Exception:
+        pass
 
     if referrer_id and not already_rewarded and referrer_id in users:
         users[referrer_id]["invited_count"] += 1
@@ -219,38 +244,58 @@ async def captcha_handler(cq: CallbackQuery):
         except Exception:
             pass
 
-    await cq.message.edit_text(
-        "✅ Капча пройдена!\n\n"
-        "📢 Теперь подайте заявку в канал:",
-        reply_markup=channel_join_kb()
-    )
+    text = "✅ Капча пройдена!\n\n📢 Теперь подайте заявку в канал:"
+    ok = await safe_edit(cq.message, text, reply_markup=channel_join_kb())
+    if not ok:
+        await cq.bot.send_message(cq.from_user.id, text, reply_markup=channel_join_kb())
 
 @user_router.callback_query(F.data == "check_join")
 async def check_join_handler(cq: CallbackQuery):
     user_id = cq.from_user.id
-    u = get_user(user_id) or ensure_user(user_id, cq.from_user.username or "")
+    u = ensure_user(user_id, cq.from_user.username or "")
     u["joined_channel"] = True
-    await cq.answer("✅ Заявка отмечена!")
-    await cq.message.edit_text("✅ Заявка отмечена! Добро пожаловать.")
-    await show_profile(cq.message)
+
+    try:
+        await cq.answer("✅ Заявка отмечена!")
+    except Exception:
+        pass
+
+    # Пытаемся убрать кнопки со старого сообщения (не критично)
+    if cq.message is not None:
+        await safe_edit(cq.message, "✅ Заявка отмечена! Добро пожаловать.")
+
+    # ГЛАВНОЕ: гарантированно отправляем профиль с клавиатурой
+    try:
+        await send_profile(cq.bot, cq.from_user.id, user_id)
+    except Exception:
+        # на случай если HTML-разметка почему-то не проходит — отправим без разметки
+        await cq.bot.send_message(
+            cq.from_user.id,
+            "✅ Добро пожаловать!",
+            reply_markup=main_menu_kb()
+        )
 
 @user_router.message(F.text == "🔗 Моя ссылка")
 async def my_link(message: Message):
     ensure_user(message.from_user.id, message.from_user.username or "")
-    link = await create_start_link(message.bot, str(message.from_user.id), encode=True)
+    try:
+        link = await create_start_link(message.bot, str(message.from_user.id), encode=True)
+    except Exception:
+        await message.answer("⚠️ Не удалось создать ссылку. Попробуйте /start.")
+        return
     invited = get_invited_count(message.from_user.id)
     await message.answer(
         f"🔗 <b>Ваша реферальная ссылка:</b>\n\n"
         f"<code>{link}</code>\n\n"
         f"{progress_bar(invited)}\n"
         f"Скопируйте ссылку и отправьте другу.",
-        parse_mode="HTML"
+        disable_web_page_preview=True
     )
 
 @user_router.message(F.text == "👤 Профиль")
 async def profile_btn(message: Message):
     ensure_user(message.from_user.id, message.from_user.username or "")
-    await show_profile(message)
+    await send_profile(message.bot, message.chat.id, message.from_user.id)
 
 @user_router.message(F.text == "🏆 Конкурс")
 async def contest_btn(message: Message):
@@ -262,7 +307,6 @@ async def contest_btn(message: Message):
         f"{progress_bar(invited)}\n\n"
         f"🎁 Победитель получает NFT: {NFT_LINK}\n\n"
         f"📹 Если приглашённый купит любое видео в канале — ваш шанс +50%.",
-        parse_mode="HTML",
         disable_web_page_preview=True
     )
 
@@ -294,7 +338,7 @@ async def stat_handler(message: Message):
         marker = " ✅" if u["invited_count"] >= INVITES_FOR_CONTEST else ""
         text += f"{name} — {u['invited_count']}{marker}\n"
 
-    await message.answer(text, parse_mode="HTML")
+    await message.answer(text)
 
 @admin_router.message(Command("m"))
 async def broadcast_handler(message: Message):

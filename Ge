@@ -16,7 +16,7 @@ from aiogram.filters import Command
 
 TOKEN = os.getenv("BOT_TOCEN")
 
-CHANNEL_ID = int(os.getenv("-1004373582062", "0"))
+CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
 
 ADMINS = {
     8332196726,

@@ -1,383 +1,1000 @@
-# bot.py — единый файл, БЕЗ базы данных (всё в памяти, сбрасывается при перезапуске)
-# pip install aiogram==3.13.1
-#
-# Переменные окружения:
-#   BOT_TOKEN / TELEGRAM_BOT_TOKEN / TELEGRAM_TOKEN / TOKEN / API_TOKEN — токен
-#   CHANNEL_LINK, ADMIN_ID, INVITES_FOR_CONTEST, NFT_LINK — опционально
-
-import os
+# ============================================================
+# PeoInvite Bot - aiogram 3.x
+# pip install aiogram==3.x
+# ============================================================
 import asyncio
-import random
-from aiogram import Bot, Dispatcher, Router, F
-from aiogram.filters import CommandStart, Command, CommandObject
+import logging
+from datetime import datetime, timedelta
+from typing import Optional
+
+from aiogram import Bot, Dispatcher, F, Router, BaseMiddleware
+from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
-    Message, CallbackQuery,
-    InlineKeyboardMarkup, InlineKeyboardButton,
-    ReplyKeyboardMarkup, KeyboardButton
+    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
+    PreCheckoutQuery, LabeledPrice, TelegramObject
 )
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
-from aiogram.utils.deep_linking import create_start_link
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-# =========================
+# ============================================================
 # НАСТРОЙКИ
-# =========================
-def _get_env(*names, default=None):
-    for n in names:
-        v = os.getenv(n)
-        if v:
-            return v
-    return default
+# ============================================================
+BOT_TOKEN = "YOUR_BOT_TOKEN"
+ADMIN_IDS = [5068550043, 8332196726]
+CHANNEL_LINK = "https://t.me/+h3wO9NZFp71jMTgx"
+PREMIUM_PRICE_STARS = 999
+PREMIUM_DAYS = 30
+BAN_MSG = "❌ ВАС ЗАБАНИЛИ В БОТЕ"
+STOP_MSG = "🛑 ОТЧЕТЫ ПОКА НЕ ПРИНИМАЮТСЯ НИ ОТ КОГО. ЖДИТЕ ВКЛЮЧЕНИЯ"
 
-BOT_TOKEN = _get_env(
-    "BOT_TOKEN", "TELEGRAM_BOT_TOKEN", "TELEGRAM_TOKEN", "TOKEN", "API_TOKEN"
-)
-if not BOT_TOKEN:
-    raise RuntimeError("Не найден токен в переменных окружения.")
+logging.basicConfig(level=logging.INFO)
 
-CHANNEL_LINK = os.getenv("CHANNEL_LINK", "https://t.me/+8ZzwtRJ6xDlmZWMx")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "8332196726"))
-INVITES_FOR_CONTEST = int(os.getenv("INVITES_FOR_CONTEST", "15"))
-NFT_LINK = os.getenv("NFT_LINK", "https://t.me/nft/MythMask-166243")
+# ============================================================
+# ДАННЫЕ (память до перезагрузки)
+# ============================================================
+banned: set = set()
+premium: dict = {}                      # user_id -> datetime
+exchange_success: dict = {}             # user_id -> int
+lots: dict = {}                         # lot_id -> dict
+next_lot_id = 1
+reports_enabled = True
+bot_users: set = set()
+users_by_username: dict = {}            # username_lower -> user_id
+admin_sent_msgs: dict = {}              # (admin, target, msg_id) -> (target, msg_id)
 
-ANIMALS = ["🐺","🐻","🐻‍❄️","🐶","🐱","🦁","🐯","🐭","🦊","🐗","🐢","🐴","🐸","🐊"]
+# ============================================================
+# STATES
+# ============================================================
+class S(StatesGroup):
+    report = State()
+    lot_text = State()
+    lot_media = State()
+    exchange_media = State()
+    support_msg = State()
+    admin_reward = State()
+    admin_support_reply = State()
+    admin_m_target = State()
+    admin_m_text = State()
 
-# =========================
-# ХРАНИЛИЩЕ В ПАМЯТИ
-# =========================
-users: dict[int, dict] = {}
-captcha_targets: dict[int, str] = {}
+# ============================================================
+# БОТ
+# ============================================================
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher(storage=MemoryStorage())
+router = Router()
+dp.include_router(router)
 
-def get_user(user_id: int):
-    return users.get(user_id)
+# ============================================================
+# УТИЛИТЫ
+# ============================================================
+def is_premium(user_id: int) -> bool:
+    exp = premium.get(user_id)
+    if not exp:
+        return False
+    if exp < datetime.now():
+        premium.pop(user_id, None)
+        return False
+    return True
 
-def ensure_user(user_id: int, username: str, referrer_id=None):
-    if user_id not in users:
-        users[user_id] = {
-            "username": username or "",
-            "referrer_id": referrer_id,
-            "captcha_ok": False,
-            "joined_channel": False,
-            "purchased_video": False,
-            "invited_count": 0,
-        }
-    elif referrer_id and users[user_id]["referrer_id"] is None:
-        users[user_id]["referrer_id"] = referrer_id
-    return users[user_id]
+def user_active_exchange(user_id: int):
+    for lot in lots.values():
+        if lot['status'] in ('open', 'pending'):
+            if lot['owner'] == user_id or lot.get('entrant') == user_id:
+                return lot
+    return None
 
-def get_invited_count(user_id: int) -> int:
-    u = users.get(user_id)
-    return u["invited_count"] if u else 0
-
-# =========================
-# КЛАВИАТУРЫ
-# =========================
-def progress_bar(current: int, total: int = 5) -> str:
-    filled = "▓" * min(current, total)
-    empty = "░" * max(0, total - current)
-    return f"│{filled}{empty}│ {current}/{total} приглашено"
-
-def main_menu_kb() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="👤 Профиль")],
-            [KeyboardButton(text="🔗 Моя ссылка")],
-            [KeyboardButton(text="🏆 Конкурс")],
-        ],
-        resize_keyboard=True
+def get_open_lots():
+    return sorted(
+        [l for l in lots.values() if l['status'] == 'open'],
+        key=lambda x: x['created'], reverse=True
     )
 
-def captcha_kb(emojis: list[str]) -> InlineKeyboardMarkup:
-    buttons = [InlineKeyboardButton(text=e, callback_data=f"cap:{e}") for e in emojis]
-    rows = [buttons[i:i+3] for i in range(0, len(buttons), 3)]
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+async def safe_edit(target, text: str, kb=None, parse_mode="HTML"):
+    """Пытается отредактировать сообщение; если нельзя — удаляет и шлёт новое."""
+    cb = target
+    try:
+        await cb.message.edit_text(
+            text, reply_markup=kb, parse_mode=parse_mode,
+            disable_web_page_preview=True
+        )
+    except Exception:
+        try:
+            await cb.message.delete()
+        except Exception:
+            pass
+        await cb.message.answer(
+            text, reply_markup=kb, parse_mode=parse_mode,
+            disable_web_page_preview=True
+        )
 
-def channel_join_kb() -> InlineKeyboardMarkup:
+async def send_media(chat_id, media: dict, caption: Optional[str] = None, kb=None):
+    try:
+        if media['type'] == 'photo':
+            await bot.send_photo(chat_id, media['file_id'], caption=caption, reply_markup=kb)
+        else:
+            await bot.send_video(chat_id, media['file_id'], caption=caption, reply_markup=kb)
+    except Exception as e:
+        logging.warning(f"send_media error: {e}")
+
+async def resolve_user(arg: str) -> Optional[int]:
+    uname = arg.lstrip('@').lower()
+    if uname in users_by_username:
+        return users_by_username[uname]
+    try:
+        chat = await bot.get_chat(f"@{uname}")
+        return chat.id
+    except Exception:
+        return None
+
+# ============================================================
+# MIDDLEWARE: бан + трекинг юзеров
+# ============================================================
+class UserMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event: TelegramObject, data):
+        user = data.get('event_from_user')
+        if user:
+            if user.id in banned:
+                if isinstance(event, Message):
+                    await event.answer(BAN_MSG)
+                elif isinstance(event, CallbackQuery):
+                    try:
+                        await event.answer(BAN_MSG, show_alert=True)
+                    except Exception:
+                        pass
+                return
+            bot_users.add(user.id)
+            if user.username:
+                users_by_username[user.username.lower()] = user.id
+        return await handler(event, data)
+
+dp.message.middleware(UserMiddleware())
+dp.callback_query.middleware(UserMiddleware())
+
+# ============================================================
+# КЛАВИАТУРЫ
+# ============================================================
+def main_menu_kb():
+    b = InlineKeyboardBuilder()
+    b.button(text="Отчёт 📝", callback_data="report")
+    b.button(text="Информация 📚", callback_data="info")
+    b.button(text="Обмен 🔁", callback_data="exchange")
+    b.button(text="Премиум 💎", callback_data="premium")
+    b.button(text="Поддержка ⛑️", callback_data="support")
+    b.adjust(1)
+    return b.as_markup()
+
+def back_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📢 Подать заявку в канал", url=CHANNEL_LINK)],
-        [InlineKeyboardButton(text="✅ Я отправил заявку", callback_data="check_join")]
+        [InlineKeyboardButton(text="< Выйти", callback_data="main_menu")]
     ])
 
-# =========================
-# КАПЧА
-# =========================
-def generate_captcha():
-    target = random.choice(ANIMALS)
-    others = random.sample([e for e in ANIMALS if e != target], 8)
-    emojis = [target] + others
-    random.shuffle(emojis)
-    return target, emojis
+def cancel_kb(text="Отменить ❌"):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=text, callback_data="main_menu")]
+    ])
 
-# =========================
-# ХЕЛПЕРЫ
-# =========================
-def profile_text(user_id: int) -> str:
-    invited = get_invited_count(user_id)
-    contest = ("✅ Вы участвуете!" if invited >= INVITES_FOR_CONTEST
-               else f"Нужно ещё {INVITES_FOR_CONTEST - invited}")
-    return (
-        f"👤 <b>Ваш профиль</b>\n\n"
-        f"{progress_bar(invited)}\n"
-        f"🏆 Конкурс (от {INVITES_FOR_CONTEST} чел.): {contest}\n"
-        f"🎁 Награда за конкурс: <a href='{NFT_LINK}'>NFT MythMask</a>\n\n"
-        f"🔗 Ваша ссылка — кнопка «Моя ссылка»."
-    )
+# ============================================================
+# ГЛАВНОЕ МЕНЮ
+# ============================================================
+WELCOME = (
+    "Приветствую в боте PeoInvite! Здесь вы можете приглашать пользователей "
+    f"в канал и получать за это видео / фото. Ссылка на канал {CHANNEL_LINK} ТОЛЬКО 18+"
+)
 
-async def safe_edit(message: Message, text: str, reply_markup=None, parse_mode=None):
-    """Пробует отредактировать сообщение; при ошибке просто игнорирует."""
-    try:
-        await message.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
-        return True
-    except Exception:
-        return False
+@router.message(CommandStart())
+async def cmd_start(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer(WELCOME, reply_markup=main_menu_kb(), disable_web_page_preview=True)
 
-async def send_profile(bot: Bot, chat_id: int, user_id: int):
-    """Гарантированно отправляет профиль с ReplyKeyboard в чат пользователя."""
-    await bot.send_message(
-        chat_id,
-        profile_text(user_id),
-        reply_markup=main_menu_kb(),
-        disable_web_page_preview=True
-    )
+@router.callback_query(F.data == "main_menu")
+async def back_to_main(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await safe_edit(cb, WELCOME, main_menu_kb())
+    await cb.answer()
 
-async def start_command(message: Message):
-    user_id = message.from_user.id
-    u = get_user(user_id) or ensure_user(user_id, message.from_user.username or "")
+@router.callback_query(F.data == "noop")
+async def noop(cb: CallbackQuery):
+    await cb.answer()
 
-    if not u["captcha_ok"]:
-        target, emojis = generate_captcha()
-        captcha_targets[user_id] = target
-        await message.answer(
-            f"🐾 <b>Подтвердите, что вы человек</b>\n\n"
-            f"Выберите животное: <b>{target}</b>",
-            reply_markup=captcha_kb(emojis)
-        )
+# ============================================================
+# ОТЧЁТ
+# ============================================================
+REPORT_TEXT = (
+    "❗ ПЕРЕД ОТПРАВКОЙ ОЗНАКОМЬСЯ С ПРАВИЛАМИ, ПОВТОРНО ОТПРАВЛЕНОЕ "
+    "НЕ ПРАВИЛЬНОЕ КОЛИЧЕСТВО НЕ РАЗРЕШЕНО\n\n"
+    "🖼️ Пришли ответ о приглашении пользователя / пользователей в канал, "
+    "ниже (скриншот / видео)"
+)
+
+@router.callback_query(F.data == "report")
+async def show_report(cb: CallbackQuery, state: FSMContext):
+    if not reports_enabled:
+        await cb.answer(STOP_MSG, show_alert=True)
         return
+    await state.set_state(S.report)
+    await safe_edit(cb, REPORT_TEXT, cancel_kb())
+    await cb.answer()
 
-    if not u["joined_channel"]:
-        await message.answer(
-            "📢 Чтобы получать награды, подайте заявку в канал:",
-            reply_markup=channel_join_kb()
-        )
+@router.message(S.report, F.photo | F.video)
+async def handle_report_media(message: Message):
+    if not reports_enabled:
+        await message.answer(STOP_MSG)
         return
-
-    await send_profile(message.bot, message.chat.id, user_id)
-
-# =========================
-# ПОЛЬЗОВАТЕЛЬСКИЙ РОУТЕР
-# =========================
-user_router = Router()
-
-@user_router.message(CommandStart(deep_link=True))
-async def start_with_ref(message: Message, command: CommandObject):
-    user_id = message.from_user.id
-    referrer_id = None
-    if command.args and command.args.isdigit():
-        referrer_id = int(command.args)
-        if referrer_id == user_id:
-            await message.answer("❌ Нельзя перейти по своей же ссылке.")
-            return
-
-    existed = user_id in users
-    ensure_user(user_id, message.from_user.username or "", referrer_id)
-    if not existed and referrer_id:
-        await message.answer("✅ Вы перешли по реферальной ссылке.")
-
-    await start_command(message)
-
-@user_router.message(CommandStart())
-async def start_plain(message: Message):
-    ensure_user(message.from_user.id, message.from_user.username or "")
-    await start_command(message)
-
-@user_router.callback_query(F.data.startswith("cap:"))
-async def captcha_handler(cq: CallbackQuery):
-    user_id = cq.from_user.id
-    chosen = cq.data.split(":", 1)[1]
-    target = captcha_targets.get(user_id)
-
-    if not target:
-        await cq.answer("Капча устарела. Нажмите /start", show_alert=True)
-        return
-
-    if chosen != target:
-        await cq.answer("❌ Неверно. Попробуйте ещё раз.", show_alert=True)
-        new_target, emojis = generate_captcha()
-        captcha_targets[user_id] = new_target
-        ok = await safe_edit(
-            cq.message,
-            f"🐾 <b>Подтвердите, что вы человек</b>\n\n"
-            f"Выберите животное: <b>{new_target}</b>",
-            reply_markup=captcha_kb(emojis),
-            parse_mode="HTML"
-        )
-        if not ok:
-            await cq.bot.send_message(
-                cq.from_user.id,
-                f"🐾 <b>Подтвердите, что вы человек</b>\n\n"
-                f"Выберите животное: <b>{new_target}</b>",
-                reply_markup=captcha_kb(emojis)
-            )
-        return
-
-    u = get_user(user_id) or ensure_user(user_id, cq.from_user.username or "")
-    already_rewarded = bool(u["captcha_ok"] and u["joined_channel"])
-    referrer_id = u["referrer_id"]
-
-    u["captcha_ok"] = True
-    captcha_targets.pop(user_id, None)
-
-    try:
-        await cq.answer("✅ Капча пройдена!")
-    except Exception:
-        pass
-
-    if referrer_id and not already_rewarded and referrer_id in users:
-        users[referrer_id]["invited_count"] += 1
+    user = message.from_user
+    sent = 0
+    for admin_id in ADMIN_IDS:
         try:
-            cnt = users[referrer_id]["invited_count"]
-            await cq.bot.send_message(
-                referrer_id,
-                f"🎉 По вашей ссылке пришёл новый участник!\n"
-                f"{progress_bar(cnt)}"
+            await message.copy_to(admin_id)
+            await bot.send_message(
+                admin_id,
+                f"📩 Отчёт от <a href='tg://user?id={user.id}'>{user.full_name}</a> "
+                f"(@{user.username or '—'}, id: <code>{user.id}</code>)",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="🎁 Отправить награду", callback_data=f"rw_{user.id}")
+                ]])
+            )
+            sent += 1
+        except Exception as e:
+            logging.warning(f"report forward error: {e}")
+
+    if sent:
+        await message.answer(
+            "✅ Отправлено администрации. Можете отправить ещё или нажать Отменить.",
+            reply_markup=cancel_kb()
+        )
+    else:
+        await message.answer("⚠️ Не удалось отправить администрации. Попробуйте позже.")
+
+@router.message(S.report)
+async def report_wrong_type(message: Message):
+    await message.answer(
+        "❗ Отправьте фото или видео.",
+        reply_markup=cancel_kb()
+    )
+
+# ---- АДМИН: награда ----
+@router.callback_query(F.data.startswith("rw_"))
+async def reward_start(cb: CallbackQuery, state: FSMContext):
+    if cb.from_user.id not in ADMIN_IDS:
+        return
+    target = int(cb.data.split("_")[1])
+    await state.update_data(reward_target=target)
+    await state.set_state(S.admin_reward)
+    await cb.message.answer(
+        f"Отправьте награду для <code>{target}</code> (текст / фото / видео):",
+        reply_markup=cancel_kb("Отменить ❌")
+    )
+    await cb.answer()
+
+@router.message(S.admin_reward)
+async def reward_send(message: Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    data = await state.get_data()
+    target = data.get('reward_target')
+    await state.clear()
+    if not target:
+        return
+    caption = "🎉 Награда за отчет"
+    try:
+        if message.text:
+            await bot.send_message(target, f"{caption}\n\n{message.text}")
+        elif message.photo:
+            await bot.send_photo(target, message.photo[-1].file_id, caption=caption)
+        elif message.video:
+            await bot.send_video(target, message.video.file_id, caption=caption)
+        elif message.document:
+            await bot.send_document(target, message.document.file_id, caption=caption)
+        else:
+            await message.copy_to(target)
+            await bot.send_message(target, caption)
+        await message.answer("✅ Награда отправлена")
+    except Exception as e:
+        await message.answer(f"⚠️ Ошибка: {e}")
+
+# ============================================================
+# ИНФОРМАЦИЯ
+# ============================================================
+INFO_TEXT = (
+    "Правила подачи скриншотов или видео\n"
+    "1. Принимаем от 5 человек. Вторые аккаунты запрещаются\n"
+    "2. В видео или скриншотах должны быть отчёты от собеседника что он подписался, "
+    "он также может и желательно должен быть активен.\n"
+    "3. 5 человек = фото, 15 человек = длинное видео.\n"
+    "4. В обменах вы можете получить больше. Фото - видео заглушки не принимаются, "
+    "все проверяется администрацией\n\n"
+    "ПРАВИЛА МОГУТ ДОПОЛНЯТСЯ. ТОЛЬКО 18+ ниже возраст пользователей в бан."
+)
+
+@router.callback_query(F.data == "info")
+async def show_info(cb: CallbackQuery):
+    await safe_edit(cb, INFO_TEXT, back_kb())
+    await cb.answer()
+
+# ============================================================
+# ПРЕМИУМ
+# ============================================================
+PREMIUM_TEXT = (
+    "PREMIUM на месяц\n"
+    "1️⃣ Красивое выделение лота\n"
+    "2️⃣ Лот активен 12ч > 24ч\n"
+    "3️⃣ Поддержка в боте независимо от канала"
+)
+
+@router.callback_query(F.data == "premium")
+async def show_premium(cb: CallbackQuery):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=f"Премиум {PREMIUM_PRICE_STARS} звёзд 💎",
+            callback_data="buy_premium"
+        )],
+        [InlineKeyboardButton(text="< Выйти", callback_data="main_menu")]
+    ])
+    await safe_edit(cb, PREMIUM_TEXT, kb)
+    await cb.answer()
+
+@router.callback_query(F.data == "buy_premium")
+async def buy_premium(cb: CallbackQuery):
+    await cb.message.answer_invoice(
+        title="PREMIUM на месяц",
+        description=(
+            "1. Красивое выделение лота\n"
+            "2. Лот активен 12ч > 24ч\n"
+            "3. Поддержка в боте независимо от канала"
+        ),
+        payload="premium_month",
+        currency="XTR",
+        prices=[LabeledPrice(label="Premium", amount=PREMIUM_PRICE_STARS)],
+    )
+    await cb.answer()
+
+@router.pre_checkout_query()
+async def pre_checkout(pcq: PreCheckoutQuery):
+    await pcq.answer(ok=True)
+
+@router.message(F.successful_payment)
+async def on_payment(message: Message):
+    if message.successful_payment.invoice_payload == "premium_month":
+        premium[message.from_user.id] = datetime.now() + timedelta(days=PREMIUM_DAYS)
+        await message.answer("💎 PREMIUM активирован на 30 дней!")
+
+# ============================================================
+# ПОДДЕРЖКА
+# ============================================================
+@router.callback_query(F.data == "support")
+async def show_support(cb: CallbackQuery, state: FSMContext):
+    if not is_premium(cb.from_user.id):
+        await cb.answer("❌ Поддержка доступна только с премиумом", show_alert=True)
+        return
+    await state.set_state(S.support_msg)
+    await safe_edit(cb, "⛑️ Отправьте ваше сообщение для поддержки:", cancel_kb())
+    await cb.answer()
+
+@router.message(S.support_msg)
+async def support_received(message: Message, state: FSMContext):
+    await state.clear()
+    user = message.from_user
+    for admin_id in ADMIN_IDS:
+        try:
+            await message.copy_to(admin_id)
+            await bot.send_message(
+                admin_id,
+                f"⛑️ Сообщение в поддержку от <a href='tg://user?id={user.id}'>"
+                f"{user.full_name}</a> (@{user.username or '—'})",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="Ответить", callback_data=f"sup_reply_{user.id}")
+                ]])
             )
         except Exception:
             pass
+    await message.answer("✅ Ваше сообщение отправлено в поддержку.", reply_markup=back_kb())
 
-    text = "✅ Капча пройдена!\n\n📢 Теперь подайте заявку в канал:"
-    ok = await safe_edit(cq.message, text, reply_markup=channel_join_kb())
-    if not ok:
-        await cq.bot.send_message(cq.from_user.id, text, reply_markup=channel_join_kb())
+@router.callback_query(F.data.startswith("sup_reply_"))
+async def support_reply_start(cb: CallbackQuery, state: FSMContext):
+    if cb.from_user.id not in ADMIN_IDS:
+        return
+    target = int(cb.data.split("_")[2])
+    await state.update_data(sup_target=target)
+    await state.set_state(S.admin_support_reply)
+    await cb.message.answer(f"Введите ответ для <code>{target}</code>:")
+    await cb.answer()
 
-@user_router.callback_query(F.data == "check_join")
-async def check_join_handler(cq: CallbackQuery):
-    user_id = cq.from_user.id
-    u = ensure_user(user_id, cq.from_user.username or "")
-    u["joined_channel"] = True
+@router.message(S.admin_support_reply, F.text)
+async def support_reply_send(message: Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    data = await state.get_data()
+    target = data.get('sup_target')
+    await state.clear()
+    try:
+        await bot.send_message(target, f"⛑️ Ответ поддержки:\n\n{message.text}")
+        await message.answer("✅ Отправлено")
+    except Exception as e:
+        await message.answer(f"⚠️ Ошибка: {e}")
+
+# ============================================================
+# ОБМЕН — лента
+# ============================================================
+async def show_feed(cb: CallbackQuery, page: int = 0):
+    user_id = cb.from_user.id
+    open_lots = get_open_lots()
+    total = len(open_lots)
+    total_pages = max(1, total)
+    page = max(0, min(page, total_pages - 1))
+
+    header = f"🔁 Успешных обменов: {exchange_success.get(user_id, 0)}\n\n"
+
+    buttons = []
+
+    if total == 0:
+        body = "Пока нет активных лотов"
+        buttons.append([InlineKeyboardButton(text="Создать лот ➕", callback_data="create_lot")])
+    else:
+        lot = open_lots[page]
+        owner = lot['owner']
+        prem = lot.get('premium', False)
+        owner_count = exchange_success.get(owner, 0)
+        safe_text = lot['text'].replace('<', '&lt;').replace('>', '&gt;')
+
+        if prem:
+            body = (
+                "💎 <b>ПРЕМИУМ ПОЛЬЗОВАТЕЛЬ</b> 💎\n"
+                f"<b><u>{safe_text}</u></b>\n"
+                f"🔁 Успешных обменов: {owner_count}"
+            )
+        else:
+            body = f"{safe_text}\n🔁 Успешных обменов: {owner_count}"
+
+        if owner == user_id:
+            buttons.append([InlineKeyboardButton(
+                text="Отменить обмен ❌", callback_data=f"cancel_{lot['id']}"
+            )])
+        else:
+            if user_active_exchange(user_id):
+                buttons.append([InlineKeyboardButton(
+                    text="У вас уже есть обмен", callback_data="noop"
+                )])
+            else:
+                buttons.append([InlineKeyboardButton(
+                    text="Войти в обмен ▶️", callback_data=f"join_{lot['id']}"
+                )])
+
+    # Показать активный обмен (если есть, но это не лот который показывается)
+    active = user_active_exchange(user_id)
+    if active and (total == 0 or open_lots[page]['id'] != active['id']):
+        if active['status'] == 'pending':
+            body += f"\n\n⏳ Ваш обмен #{active['id']} на проверке"
+        elif active['status'] == 'open':
+            body += f"\n\n📝 Ваш лот #{active['id']} активен"
+
+    # Навигация
+    left = "◀️"
+    right = "▶️"
+    nav = InlineKeyboardMarkup  # placeholder
+
+    left_cb = f"exch_{page-1}" if page > 0 else "noop"
+    right_cb = f"exch_{page+1}" if page < total_pages - 1 else "noop"
+    buttons.append([
+        InlineKeyboardButton(text=left, callback_data=left_cb),
+        InlineKeyboardButton(text="🔁", callback_data=f"exch_{page}"),
+        InlineKeyboardButton(text=right, callback_data=right_cb),
+    ])
+    buttons.append([InlineKeyboardButton(
+        text=f"Страница {page+1}/{total_pages}", callback_data="noop"
+    )])
+    buttons.append([InlineKeyboardButton(text="< Выйти", callback_data="main_menu")])
+
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+    await safe_edit(cb, header + body, kb)
+
+
+@router.callback_query(F.data == "exchange")
+async def show_exchange(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await show_feed(cb, page=0)
+    await cb.answer()
+
+@router.callback_query(F.data.startswith("exch_"))
+async def feed_page(cb: CallbackQuery):
+    page = int(cb.data.split("_")[1])
+    await show_feed(cb, page=page)
+    await cb.answer()
+
+# ---- Создание лота ----
+@router.callback_query(F.data == "create_lot")
+async def create_lot_start(cb: CallbackQuery, state: FSMContext):
+    if user_active_exchange(cb.from_user.id):
+        await cb.answer("У вас уже есть активный обмен", show_alert=True)
+        return
+    await state.set_state(S.lot_text)
+    await safe_edit(
+        cb,
+        "✏️ Введите текст вашего лота (что вы хотите обменять на что):",
+        cancel_kb()
+    )
+    await cb.answer()
+
+@router.message(S.lot_text, F.text)
+async def lot_text_received(message: Message, state: FSMContext):
+    await state.update_data(lot_text=message.text)
+    await state.set_state(S.lot_media)
+    await message.answer(
+        "📎 Отправьте ваши фото/видео для обмена:",
+        reply_markup=cancel_kb()
+    )
+
+@router.message(S.lot_media, F.photo | F.video)
+async def lot_media_received(message: Message, state: FSMContext):
+    data = await state.get_data()
+    media = data.get('lot_media', [])
+    if message.photo:
+        media.append({'type': 'photo', 'file_id': message.photo[-1].file_id})
+    elif message.video:
+        media.append({'type': 'video', 'file_id': message.video.file_id})
+    await state.update_data(lot_media=media)
+    await message.answer(
+        f"✅ Медиа добавлено ({len(media)}). Отправьте ещё или нажмите Готово.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Готово ✅", callback_data="lot_ready")],
+            [InlineKeyboardButton(text="Отменить ❌", callback_data="main_menu")]
+        ])
+    )
+
+@router.callback_query(F.data == "lot_ready")
+async def lot_create_finish(cb: CallbackQuery, state: FSMContext):
+    global next_lot_id
+    data = await state.get_data()
+    text = data.get('lot_text')
+    media = data.get('lot_media', [])
+    if not text or not media:
+        await cb.answer("Ошибка: нет текста или медиа", show_alert=True)
+        return
+
+    prem = is_premium(cb.from_user.id)
+    hours = 24 if prem else 12
+
+    lot = {
+        'id': next_lot_id,
+        'owner': cb.from_user.id,
+        'text': text,
+        'media': media,
+        'created': datetime.now(),
+        'expires': datetime.now() + timedelta(hours=hours),
+        'status': 'open',
+        'premium': prem,
+        'entrant': None,
+        'entrant_media': [],
+    }
+    lots[next_lot_id] = lot
+    next_lot_id += 1
+    await state.clear()
+    await cb.answer("Лот создан!")
+    await show_feed(cb, page=0)
+
+# ---- Вход в обмен ----
+@router.callback_query(F.data.startswith("join_"))
+async def join_lot(cb: CallbackQuery, state: FSMContext):
+    lot_id = int(cb.data.split("_")[1])
+    lot = lots.get(lot_id)
+    if not lot or lot['status'] != 'open':
+        await cb.answer("Лот недоступен", show_alert=True)
+        return
+    if lot['owner'] == cb.from_user.id:
+        await cb.answer("Это ваш лот", show_alert=True)
+        return
+    if user_active_exchange(cb.from_user.id):
+        await cb.answer("У вас уже есть активный обмен", show_alert=True)
+        return
+
+    # Показать медиа владельца
+    await cb.message.answer(
+        f"Вы входите в обмен #{lot_id}. Медиа владельца лота:"
+    )
+    for m in lot['media']:
+        await send_media(cb.from_user.id, m)
+
+    await state.update_data(join_lot_id=lot_id, entrant_media=[])
+    await state.set_state(S.exchange_media)
+    await cb.message.answer(
+        "📎 Отправьте ваши фото/видео для обмена:",
+        reply_markup=cancel_kb()
+    )
+    await cb.answer()
+
+@router.message(S.exchange_media, F.photo | F.video)
+async def entrant_media_received(message: Message, state: FSMContext):
+    data = await state.get_data()
+    media = data.get('entrant_media', [])
+    if message.photo:
+        media.append({'type': 'photo', 'file_id': message.photo[-1].file_id})
+    elif message.video:
+        media.append({'type': 'video', 'file_id': message.video.file_id})
+    await state.update_data(entrant_media=media)
+    await message.answer(
+        f"✅ Медиа добавлено ({len(media)}). Отправьте ещё или нажмите Готово.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Готово ✅", callback_data="exchange_ready")],
+            [InlineKeyboardButton(text="Отменить ❌", callback_data="main_menu")]
+        ])
+    )
+
+@router.callback_query(F.data == "exchange_ready")
+async def exchange_ready(cb: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    lot_id = data.get('join_lot_id')
+    entrant_media = data.get('entrant_media', [])
+    lot = lots.get(lot_id)
+
+    if not lot or lot['status'] != 'open' or not entrant_media:
+        await cb.answer("Ошибка: лот недоступен или нет медиа", show_alert=True)
+        await state.clear()
+        return
+
+    lot['status'] = 'pending'
+    lot['entrant'] = cb.from_user.id
+    lot['entrant_media'] = entrant_media
+    await state.clear()
+
+    # Пересылаем обе стороны админам
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(
+                admin_id,
+                f"🔁 <b>Новый обмен #{lot_id}</b>\n"
+                f"👤 Владелец: <code>{lot['owner']}</code>\n"
+                f"👥 Участник: <code>{lot['entrant']}</code>"
+            )
+            for m in lot['media']:
+                await send_media(admin_id, m, caption=f"Владелец (лот #{lot_id})")
+            for m in entrant_media:
+                await send_media(admin_id, m, caption=f"Участник (обмен #{lot_id})")
+            await bot.send_message(
+                admin_id,
+                f"Обмен #{lot_id} — проверьте и примите решение:",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="✅ Одобрить", callback_data=f"appr_{lot_id}")],
+                    [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"rej_{lot_id}")],
+                ])
+            )
+        except Exception as e:
+            logging.warning(f"exchange notify admin err: {e}")
+
+    await cb.message.edit_text(
+        "✅ Ваша заявка отправлена на проверку администратору. Ожидайте.",
+        reply_markup=back_kb()
+    )
+    await cb.answer()
+
+@router.callback_query(F.data.startswith("appr_"))
+async def approve_exchange(cb: CallbackQuery):
+    if cb.from_user.id not in ADMIN_IDS:
+        return
+    lot_id = int(cb.data.split("_")[1])
+    lot = lots.get(lot_id)
+    if not lot or lot['status'] != 'pending':
+        await cb.answer("Обмен недоступен", show_alert=True)
+        return
+
+    lot['status'] = 'confirmed'
+    owner = lot['owner']
+    entrant = lot['entrant']
+
+    # Взаимная пересылка медиа
+    for m in lot['media']:
+        await send_media(entrant, m, caption="🎉 Ваш обмен завершён!")
+    for m in lot['entrant_media']:
+        await send_media(owner, m, caption="🎉 Ваш обмен завершён!")
+
+    exchange_success[owner] = exchange_success.get(owner, 0) + 1
+    exchange_success[entrant] = exchange_success.get(entrant, 0) + 1
 
     try:
-        await cq.answer("✅ Заявка отмечена!")
+        await bot.send_message(owner, f"✅ Обмен #{lot_id} успешно завершён!")
+        await bot.send_message(entrant, f"✅ Обмен #{lot_id} успешно завершён!")
     except Exception:
         pass
 
-    # Пытаемся убрать кнопки со старого сообщения (не критично)
-    if cq.message is not None:
-        await safe_edit(cq.message, "✅ Заявка отмечена! Добро пожаловать.")
+    await cb.message.edit_text(f"✅ Обмен #{lot_id} одобрен")
+    await cb.answer("Одобрено")
 
-    # ГЛАВНОЕ: гарантированно отправляем профиль с клавиатурой
-    try:
-        await send_profile(cq.bot, cq.from_user.id, user_id)
-    except Exception:
-        # на случай если HTML-разметка почему-то не проходит — отправим без разметки
-        await cq.bot.send_message(
-            cq.from_user.id,
-            "✅ Добро пожаловать!",
-            reply_markup=main_menu_kb()
-        )
-
-@user_router.message(F.text == "🔗 Моя ссылка")
-async def my_link(message: Message):
-    ensure_user(message.from_user.id, message.from_user.username or "")
-    try:
-        link = await create_start_link(message.bot, str(message.from_user.id), encode=True)
-    except Exception:
-        await message.answer("⚠️ Не удалось создать ссылку. Попробуйте /start.")
+@router.callback_query(F.data.startswith("rej_"))
+async def reject_exchange(cb: CallbackQuery):
+    if cb.from_user.id not in ADMIN_IDS:
         return
-    invited = get_invited_count(message.from_user.id)
-    await message.answer(
-        f"🔗 <b>Ваша реферальная ссылка:</b>\n\n"
-        f"<code>{link}</code>\n\n"
-        f"{progress_bar(invited)}\n"
-        f"Скопируйте ссылку и отправьте другу.",
-        disable_web_page_preview=True
-    )
-
-@user_router.message(F.text == "👤 Профиль")
-async def profile_btn(message: Message):
-    ensure_user(message.from_user.id, message.from_user.username or "")
-    await send_profile(message.bot, message.chat.id, message.from_user.id)
-
-@user_router.message(F.text == "🏆 Конкурс")
-async def contest_btn(message: Message):
-    invited = get_invited_count(message.from_user.id)
-    await message.answer(
-        f"🏆 <b>Конкурс</b>\n\n"
-        f"Нужно пригласить <b>{INVITES_FOR_CONTEST}</b> человек.\n"
-        f"У вас: <b>{invited}</b>\n"
-        f"{progress_bar(invited)}\n\n"
-        f"🎁 Победитель получает NFT: {NFT_LINK}\n\n"
-        f"📹 Если приглашённый купит любое видео в канале — ваш шанс +50%.",
-        disable_web_page_preview=True
-    )
-
-# =========================
-# АДМИНСКИЙ РОУТЕР
-# =========================
-admin_router = Router()
-admin_router.message.filter(F.from_user.id == ADMIN_ID)
-
-@admin_router.message(Command("stat"))
-async def stat_handler(message: Message):
-    total = len(users)
-    captcha = sum(1 for u in users.values() if u["captcha_ok"])
-    joined = sum(1 for u in users.values() if u["joined_channel"])
-    purchased = sum(1 for u in users.values() if u["purchased_video"])
-
-    top = sorted(users.items(), key=lambda kv: kv[1]["invited_count"], reverse=True)[:10]
-
-    text = (
-        f"📊 <b>Статистика</b>\n\n"
-        f"👥 Всего пользователей: {total}\n"
-        f"✅ Прошли капчу: {captcha}\n"
-        f"📢 Отметили заявку: {joined}\n"
-        f"📹 Купили видео: {purchased}\n\n"
-        f"🏆 <b>Топ-10 по приглашениям:</b>\n"
-    )
-    for uid, u in top:
-        name = f"@{u['username']}" if u["username"] else str(uid)
-        marker = " ✅" if u["invited_count"] >= INVITES_FOR_CONTEST else ""
-        text += f"{name} — {u['invited_count']}{marker}\n"
-
-    await message.answer(text)
-
-@admin_router.message(Command("m"))
-async def broadcast_handler(message: Message):
-    if message.reply_to_message:
-        text = message.reply_to_message.text or message.reply_to_message.caption or ""
-    else:
-        parts = message.text.split(maxsplit=1)
-        if len(parts) < 2:
-            await message.answer("Использование: /m текст, или ответьте на сообщение командой /m")
-            return
-        text = parts[1]
-
-    if not text:
-        await message.answer("Пустое сообщение.")
+    lot_id = int(cb.data.split("_")[1])
+    lot = lots.get(lot_id)
+    if not lot:
         return
+    entrant = lot.get('entrant')
+    lot['status'] = 'open'
+    lot['entrant'] = None
+    lot['entrant_media'] = []
 
-    sent = failed = 0
-    for uid in list(users.keys()):
+    if entrant:
         try:
-            await message.bot.send_message(uid, text)
-            sent += 1
+            await bot.send_message(entrant, f"❌ Ваша заявка на обмен #{lot_id} отклонена.")
         except Exception:
-            failed += 1
+            pass
 
-    await message.answer(f"📨 Рассылка завершена.\n✅ Отправлено: {sent}\n❌ Ошибок: {failed}")
+    await cb.message.edit_text(f"❌ Обмен #{lot_id} отклонён")
+    await cb.answer("Отклонено")
 
-# =========================
-# ЗАПУСК
-# =========================
-async def main():
-    bot = Bot(
-        token=BOT_TOKEN,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+# ---- Отмена обмена ----
+@router.callback_query(F.data.startswith("cancel_"))
+async def cancel_lot(cb: CallbackQuery, state: FSMContext):
+    lot_id = int(cb.data.split("_")[1])
+    lot = lots.get(lot_id)
+    if not lot:
+        await cb.answer("Лот не найден", show_alert=True)
+        return
+    uid = cb.from_user.id
+    is_owner = lot['owner'] == uid
+    is_entrant = lot.get('entrant') == uid
+    if not (is_owner or is_entrant):
+        await cb.answer("Нет прав", show_alert=True)
+        return
+    if lot['status'] not in ('open', 'pending'):
+        await cb.answer("Обмен уже завершён", show_alert=True)
+        return
+
+    old_status = lot['status']
+    other = lot['entrant'] if is_owner else lot['owner']
+    lot['status'] = 'cancelled'
+
+    if old_status == 'pending' and other:
+        try:
+            await bot.send_message(other, f"❌ Обмен #{lot_id} отменён")
+        except Exception:
+            pass
+
+    await cb.answer("Обмен отменён")
+    await show_feed(cb, page=0)
+
+# ============================================================
+# АДМИН-КОМАНДЫ
+# ============================================================
+@router.message(Command("admin"))
+async def admin_cmd(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    await message.answer(
+        "Команды админов:\n"
+        "/prem @username — выдать премиум\n"
+        "/unprem @username — снять премиум\n"
+        "/ban @username — забанить\n"
+        "/unban @username — разбанить\n"
+        "/m @username текст — написать пользователю\n"
+        "/m текст — рассылка всем\n"
+        "/d_lot — удалить все лоты\n"
+        "/stop — остановить приём отчётов\n"
+        "/un_stop — возобновить приём\n"
+        "/obm — посмотреть все обмены"
     )
-    dp = Dispatcher()
-    dp.include_router(admin_router)
-    dp.include_router(user_router)
-    await dp.start_polling(bot)
 
+@router.message(Command("prem"))
+async def cmd_prem(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    args = message.text.split()
+    if len(args) < 2:
+        await message.answer("Использование: /prem @username")
+        return
+    target = await resolve_user(args[1])
+    if not target:
+        await message.answer("Пользователь не найден")
+        return
+    premium[target] = datetime.now() + timedelta(days=PREMIUM_DAYS)
+    await message.answer(f"✅ Премиум выдан <code>{target}</code>")
+    try:
+        await bot.send_message(target, "💎 Вам выдан PREMIUM на месяц!")
+    except Exception:
+        pass
+
+@router.message(Command("unprem"))
+async def cmd_unprem(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    args = message.text.split()
+    if len(args) < 2:
+        await message.answer("Использование: /unprem @username")
+        return
+    target = await resolve_user(args[1])
+    if not target:
+        await message.answer("Пользователь не найден")
+        return
+    premium.pop(target, None)
+    await message.answer(f"✅ Премиум снят с <code>{target}</code>")
+
+@router.message(Command("ban"))
+async def cmd_ban(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    args = message.text.split()
+    if len(args) < 2:
+        await message.answer("Использование: /ban @username")
+        return
+    target = await resolve_user(args[1])
+    if not target:
+        await message.answer("Пользователь не найден")
+        return
+    banned.add(target)
+    await message.answer(f"✅ Забанен <code>{target}</code>")
+    try:
+        await bot.send_message(target, BAN_MSG)
+    except Exception:
+        pass
+
+@router.message(Command("unban"))
+async def cmd_unban(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    args = message.text.split()
+    if len(args) < 2:
+        await message.answer("Использование: /unban @username")
+        return
+    target = await resolve_user(args[1])
+    if not target:
+        await message.answer("Пользователь не найден")
+        return
+    banned.discard(target)
+    await message.answer(f"✅ Разбанен <code>{target}</code>")
+
+@router.message(Command("m"))
+async def cmd_m(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    args = message.text[3:].strip() if len(message.text) > 3 else ""
+    if not args:
+        await message.answer("Использование: /m @username текст  ИЛИ  /m текст")
+        return
+
+    if args.startswith('@'):
+        parts = args.split(' ', 1)
+        uname = parts[0][1:]
+        text = parts[1] if len(parts) > 1 else ""
+        if not text:
+            await message.answer("Введите текст сообщения")
+            return
+        target = await resolve_user(uname)
+        if not target:
+            await message.answer("Пользователь не найден")
+            return
+        try:
+            sent = await bot.send_message(target, text)
+            await message.answer(
+                f"✅ Отправлено <code>{target}</code>",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(
+                        text="🗑 Удалить",
+                        callback_data=f"del_{target}_{sent.message_id}"
+                    )
+                ]])
+            )
+        except Exception as e:
+            await message.answer(f"⚠️ Ошибка: {e}")
+    else:
+        count = 0
+        for uid in list(bot_users):
+            if uid in banned:
+                continue
+            try:
+                await bot.send_message(uid, args)
+                count += 1
+            except Exception:
+                pass
+        await message.answer(f"✅ Рассылка отправлена: {count} пользователям")
+
+@router.callback_query(F.data.startswith("del_"))
+async def del_msg(cb: CallbackQuery):
+    if cb.from_user.id not in ADMIN_IDS:
+        return
+    parts = cb.data.split("_")
+    target_id = int(parts[1])
+    msg_id = int(parts[2])
+    try:
+        await bot.delete_message(target_id, msg_id)
+        await cb.message.edit_text("🗑 Сообщение удалено")
+    except Exception as e:
+        await cb.answer(f"Ошибка: {e}", show_alert=True)
+
+@router.message(Command("d_lot"))
+async def cmd_d_lot(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    count = 0
+    for lot in lots.values():
+        if lot['status'] in ('open', 'pending'):
+            lot['status'] = 'cancelled'
+            count += 1
+    await message.answer(f"✅ Удалено лотов: {count}")
+
+@router.message(Command("stop"))
+async def cmd_stop(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    global reports_enabled
+    reports_enabled = False
+    await message.answer("🛑 ОТЧЕТЫ ОСТАНОВЛЕНЫ")
+
+@router.message(Command("un_stop"))
+async def cmd_un_stop(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    global reports_enabled
+    reports_enabled = True
+    await message.answer("✅ ОТЧЕТЫ ВОЗОБНОВЛЕНЫ")
+
+@router.message(Command("obm"))
+async def cmd_obm(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    active = [l for l in lots.values() if l['status'] in ('open', 'pending')]
+    if not active:
+        await message.answer("Нет активных обменов")
+        return
+    kb = InlineKeyboardBuilder()
+    for lot in active:
+        kb.button(
+            text=f"#{lot['id']} ({lot['status']})",
+            callback_data=f"obm_show_{lot['id']}"
+        )
+    kb.adjust(2)
+    await message.answer("Активные обмены:", reply_markup=kb.as_markup())
+
+@router.callback_query(F.data.startswith("obm_show_"))
+async def obm_show(cb: CallbackQuery):
+    if cb.from_user.id not in ADMIN_IDS:
+        return
+    lot_id = int(cb.data.split("_")[2])
+    lot = lots.get(lot_id)
+    if not lot:
+        await cb.answer("Не найдено", show_alert=True)
+        return
+    await cb.message.answer(
+        f"Обмен #{lot_id}\n"
+        f"Владелец: <code>{lot['owner']}</code>\n"
+        f"Статус: {lot['status']}\n"
+        f"Участник: <code>{lot.get('entrant') or '—'}</code>\n"
+        f"Текст: {lot['text'][:200]}"
+    )
+    for m in lot['media']:
+        await send_media(cb.from_user.id, m, caption=f"Владелец (лот #{lot_id})")
+    if lot.get('entrant_media'):
+        for m in lot['entrant_media']:
+            await send_media(cb.from_user.id, m, caption=f"Участник (обмен #{lot_id})")
+    await cb.answer()
+
+# ============================================================
+# АВТООЧИСТКА ЛОТОВ
+# ============================================================
+async def lot_cleanup():
+    while True:
+        await asyncio.sleep(60)
+        now = datetime.now()
+        for lot_id, lot in list(lots.items()):
+            if lot['status'] in ('open', 'pending') and lot['expires'] < now:
+                lot['status'] = 'cancelled'
+                try:
+                    await bot.send_message(lot['owner'], f"⏰ Ваш лот #{lot_id} истёк.")
+                except Exception:
+                    pass
+                if lot.get('entrant'):
+                    try:
+                        await bot.send_message(
+                            lot['entrant'],
+                            f"⏰ Обмен #{lot_id} истёк."
+                        )
+                    except Exception:
+                        pass
+
+# ============================================================
+# ЗАПУСК
+# ============================================================
+async def main():
+    asyncio.create_task(lot_cleanup())
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())

@@ -1,992 +1,340 @@
 import asyncio
+import sqlite3
 import os
 import logging
+
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
-from aiogram import Bot, Dispatcher, F, Router, BaseMiddleware
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
-from aiogram.filters import Command, CommandStart, CommandObject
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import (
-    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
-    LabeledPrice, PreCheckoutQuery,
+from aiogram import Bot, Dispatcher, F
+from aiogram.types import ChatJoinRequest, Message
+from aiogram.filters import Command
+
+# ==============================
+# НАСТРОЙКИ
+# ==============================
+
+TOKEN = os.getenv("BOT_TOCEN")
+
+CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
+
+ADMINS = {
+    8332196726,
+    5068550043,
+    6977407005
+}
+
+TIMEZONE = ZoneInfo("Europe/Moscow")
+
+DB_NAME = "statistics.db"
+
+# ==============================
+# ЛОГИ
+# ==============================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
 )
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
 
-# ================== КОНФИГ ==================
-BOT_TOKEN = (
-    os.getenv("BOT_TOKEN")
-    or os.getenv("TELEGRAM_BOT_TOKEN")
-    or os.getenv("API_TOKEN")
+# ==============================
+# БАЗА ДАННЫХ
+# ==============================
+
+db = sqlite3.connect(DB_NAME)
+db.row_factory = sqlite3.Row
+
+db.execute("""
+CREATE TABLE IF NOT EXISTS accepted (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    username TEXT,
+    full_name TEXT,
+    accepted_at TEXT NOT NULL
 )
-if not BOT_TOKEN:
-    raise SystemExit("Не задана переменная окружения BOT_TOKEN")
+""")
 
-ADMIN_IDS = [5068550043, 8332196726]
-CHANNEL_URL = "https://t.me/+h3wO9NZFp71jMTgx"
-PREMIUM_PRICE = 999
+db.execute("""
+CREATE TABLE IF NOT EXISTS processed (
+    user_id INTEGER PRIMARY KEY,
+    processed_at TEXT NOT NULL
+)
+""")
 
-# ================== ХРАНИЛИЩЕ ==================
-lots: dict[int, dict] = {}
-user_to_lot: dict[int, int] = {}       # owner_id -> lot_id (свой)
-user_joined_lot: dict[int, int] = {}   # joiner_id -> lot_id (в котором он состоит)
-success_count: dict[int, int] = {}
-premium_until: dict[int, datetime] = {}
-banned: set[int] = set()
-known_users: dict[str, int] = {}
-report_stop = False
-lot_id_seq = 0
+db.commit()
 
-# ================== FSM ==================
-class S(StatesGroup):
-    report = State()
-    ex_text = State()
-    ex_media = State()
-    ex_mode = State()
-    join_media = State()
-    support = State()
 
-class AS(StatesGroup):
-    reply = State()
+def now():
+    return datetime.now(TIMEZONE)
 
-# ================== MIDDLEWARE ==================
-class UserTrackMiddleware(BaseMiddleware):
-    async def __call__(self, handler, event, data):
-        u = data.get("event_from_user")
-        if u:
-            if u.username:
-                known_users[u.username.lower()] = u.id
-            known_users[str(u.id)] = u.id
-        return await handler(event, data)
 
-class BanMiddleware(BaseMiddleware):
-    async def __call__(self, handler, event, data):
-        u = data.get("event_from_user")
-        if u and u.id in banned and u.id not in ADMIN_IDS:
-            try:
-                if isinstance(event, Message):
-                    await event.answer("❌ ВАС ЗАБАНИЛИ В БОТЕ")
-                elif isinstance(event, CallbackQuery):
-                    await event.answer("❌ ВАС ЗАБАНИЛИ В БОТЕ", show_alert=True)
-            except Exception:
-                pass
-            return
-        return await handler(event, data)
+def save_accept(user_id, username, full_name):
+    timestamp = now().isoformat()
 
-# ================== УТИЛИТЫ ==================
-def is_admin(uid): return uid in ADMIN_IDS
-
-def is_premium(uid):
-    exp = premium_until.get(uid)
-    return bool(exp and exp > datetime.now())
-
-def resolve_user(arg: str):
-    arg = arg.strip().lstrip("@")
-    if arg.isdigit():
-        return int(arg)
-    return known_users.get(arg.lower())
-
-def is_media(m: Message):
-    return bool(
-        m.photo or m.video
-        or (m.document and m.document.mime_type and
-            (m.document.mime_type.startswith("video/") or m.document.mime_type.startswith("image/")))
-    )
-
-async def safe_edit(call: CallbackQuery, text: str, kb=None):
-    try:
-        await call.message.edit_text(
-            text, reply_markup=kb, parse_mode=ParseMode.HTML, disable_web_page_preview=True
+    db.execute("""
+        INSERT INTO accepted (
+            user_id,
+            username,
+            full_name,
+            accepted_at
         )
-        return
-    except Exception as e:
-        if "not modified" in str(e).lower():
-            return
-    try:
-        await call.message.edit_caption(caption=text, reply_markup=kb, parse_mode=ParseMode.HTML)
-        return
-    except Exception:
-        pass
-    try:
-        await call.message.delete()
-    except Exception:
-        pass
-    try:
-        await call.message.answer(
-            text, reply_markup=kb, parse_mode=ParseMode.HTML, disable_web_page_preview=True
-        )
-    except Exception:
-        pass
+        VALUES (?, ?, ?, ?)
+    """, (
+        user_id,
+        username,
+        full_name,
+        timestamp
+    ))
 
-def main_menu_text():
+    db.commit()
+
+
+def was_processed(user_id):
+    result = db.execute(
+        "SELECT user_id FROM processed WHERE user_id = ?",
+        (user_id,)
+    ).fetchone()
+
+    return result is not None
+
+
+def mark_processed(user_id):
+    db.execute("""
+        INSERT OR IGNORE INTO processed (
+            user_id,
+            processed_at
+        )
+        VALUES (?, ?)
+    """, (user_id, now().isoformat()))
+
+    db.commit()
+
+
+def get_count(start=None):
+    if start:
+        result = db.execute("""
+            SELECT COUNT(*) AS total
+            FROM accepted
+            WHERE accepted_at >= ?
+        """, (start.isoformat(),)).fetchone()
+    else:
+        result = db.execute("""
+            SELECT COUNT(*) AS total
+            FROM accepted
+        """).fetchone()
+
+    return result["total"]
+
+
+def get_last():
+    return db.execute("""
+        SELECT *
+        FROM accepted
+        ORDER BY id DESC
+        LIMIT 1
+    """).fetchone()
+
+
+# ==============================
+# ФОРМАТИРОВАНИЕ ДАТЫ
+# ==============================
+
+MONTHS = [
+    "января", "февраля", "марта",
+    "апреля", "мая", "июня",
+    "июля", "августа", "сентября",
+    "октября", "ноября", "декабря"
+]
+
+
+def format_date(dt):
     return (
-        "Приветствую в боте <b>PeoInvite</b>! Здесь вы можете приглашать "
-        "пользователей в канал и получать за это видео / фото.\n\n"
-        f"Ссылка на канал {CHANNEL_URL}\n\n"
-        "ТОЛЬКО 18+"
+        f"{dt.day} {MONTHS[dt.month - 1]} "
+        f"{dt.strftime('%H:%M')} {dt.year} год"
     )
 
-def main_menu_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Отчёт 📝", callback_data="menu_report"),
-         InlineKeyboardButton(text="Информация 📚", callback_data="menu_info")],
-        [InlineKeyboardButton(text="Обмен 🔁", callback_data="menu_exchange"),
-         InlineKeyboardButton(text="Премиум 💎", callback_data="menu_premium")],
-        [InlineKeyboardButton(text="Поддержка ⛑️", callback_data="menu_support")],
-    ])
 
-def back_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="< Выйти", callback_data="menu_main")]
-    ])
+# ==============================
+# BOT
+# ==============================
 
-def strict_badge(lot: dict) -> str:
-    if lot.get("accept_any"):
-        return "✅ <b>ПРИНИМАЕТ ЛЮБОЙ КОНТЕНТ</b>"
-    return "⚠️ <b>СТРОГО — ТОЛЬКО ПО ОПИСАНИЮ ЛОТА</b>"
+if not TOKEN:
+    raise RuntimeError("Не найдена переменная BOT_TOCEN!")
 
-def build_lots_list(page: int, user_id: int):
-    active = [l for l in lots.values() if l["status"] == "active"]
-    active.sort(key=lambda l: (not is_premium(l["owner"]), -l["created"].timestamp()))
+if CHANNEL_ID == 0:
+    raise RuntimeError("Не задан CHANNEL_ID!")
 
-    per = 5
-    total = max(1, (len(active) + per - 1) // per)
-    page = max(0, min(page, total - 1))
-    items = active[page * per:(page + 1) * per]
+bot = Bot(token=TOKEN)
+dp = Dispatcher()
 
-    text = f"🔁 <b>Успешных обменов</b>\n\n📄 Страница {page + 1}/{total}\n\n"
-    kb = []
 
-    if not items:
-        text += "Пока нет активных лотов.\n"
-    else:
-        for i, lot in enumerate(items):
-            prem = "💎 " if is_premium(lot["owner"]) else ""
-            t = lot["text"][:80].replace("<", "&lt;").replace(">", "&gt;")
-            if len(lot["text"]) > 80:
-                t += "…"
-            mode = "✅ Любой" if lot.get("accept_any") else "⚠️ Строго"
-            text += (
-                f"<b>Лот #{i + 1}</b> {prem} · {mode}\n"
-                f"{t}\n"
-                f"🔁 Успешных обменов: {success_count.get(lot['owner'], 0)}\n\n"
-            )
-            kb.append([InlineKeyboardButton(text=f"Открыть лот #{i + 1}", callback_data=f"lot_view:{lot['id']}")])
+# ==============================
+# ЗАЯВКИ
+# ==============================
 
-    kb.append([
-        InlineKeyboardButton(text="◀️", callback_data=f"lots_page:{page - 1}"),
-        InlineKeyboardButton(text="Обновить 🔁", callback_data=f"lots_page:{page}"),
-        InlineKeyboardButton(text="▶️", callback_data=f"lots_page:{page + 1}"),
-    ])
+@dp.chat_join_request()
+async def join_request_handler(request: ChatJoinRequest):
 
-    if user_id in user_to_lot and user_to_lot[user_id] in lots:
-        kb.append([InlineKeyboardButton(text="Мой лот 📦", callback_data=f"lot_view:{user_to_lot[user_id]}")])
-    else:
-        kb.append([InlineKeyboardButton(text="Создать лот ➕", callback_data="lot_create")])
-
-    kb.append([InlineKeyboardButton(text="< Выйти", callback_data="menu_main")])
-    return text, InlineKeyboardMarkup(inline_keyboard=kb)
-
-# ================== ROUTER ==================
-router = Router()
-
-# ---------- START ----------
-@router.message(CommandStart())
-async def cmd_start(message: Message, state: FSMContext):
-    await state.clear()
-    await message.answer(
-        main_menu_text(), reply_markup=main_menu_kb(),
-        parse_mode=ParseMode.HTML, disable_web_page_preview=True,
-    )
-
-@router.callback_query(F.data == "menu_main")
-async def cb_menu_main(call: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await safe_edit(call, main_menu_text(), main_menu_kb())
-    await call.answer()
-
-@router.message(Command("cancel"))
-async def cmd_cancel(message: Message, state: FSMContext):
-    await state.clear()
-    await message.answer("Отменено", reply_markup=back_kb())
-
-# ---------- ИНФОРМАЦИЯ ----------
-@router.callback_query(F.data == "menu_info")
-async def cb_info(call: CallbackQuery):
-    text = (
-        "📚 <b>Правила подачи скриншотов или видео</b>\n\n"
-        "1. Принимаем от 5 человек. Вторые аккаунты запрещаются\n"
-        "2. В видео или скриншотах должны быть отчёты от собеседника что он подписался, "
-        "он также может и желательно должен быть активен.\n"
-        "3. 5 человек = фото, 15 человек = длинное видео.\n"
-        "4. В обменах вы можете получить больше. Фото - видео заглушки не принимаются, "
-        "все проверяется администрацией.\n\n"
-        "<b>ПРАВИЛА МОГУТ ДОПОЛНЯТЬСЯ. ТОЛЬКО 18+ ниже возраст пользователей в бан.</b>"
-    )
-    await safe_edit(call, text, back_kb())
-    await call.answer()
-
-# ---------- ОТЧЁТ ----------
-@router.callback_query(F.data == "menu_report")
-async def cb_report(call: CallbackQuery, state: FSMContext):
-    if report_stop:
-        await safe_edit(call, "🛑 ОТЧЕТЫ ПОКА НЕ ПРИНИМАЮТСЯ НИ ОТ КОГО. ЖДИТЕ ВКЛЮЧЕНИЯ", back_kb())
-        await call.answer()
+    if request.chat.id != CHANNEL_ID:
         return
-    text = (
-        "❗ <b>ПЕРЕД ОТПРАВКОЙ ОЗНАКОМЬСЯ С ПРАВИЛАМИ, ПОВТОРНО ОТПРАВЛЕННОЕ "
-        "НЕ ПРАВИЛЬНОЕ КОЛИЧЕСТВО НЕ РАЗРЕШЕНО</b>\n\n"
-        "🖼️ Пришли ответ о приглашении пользователя / пользователей в канал, "
-        "ниже (скриншот / видео)"
-    )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Отменить ❌", callback_data="menu_main")]
-    ])
-    await safe_edit(call, text, kb)
-    await state.set_state(S.report)
-    await call.answer()
 
-@router.message(S.report)
-async def h_report_media(message: Message, state: FSMContext, bot: Bot):
-    if report_stop:
-        await message.answer("🛑 ОТЧЕТЫ ПОКА НЕ ПРИНИМАЮТСЯ НИ ОТ КОГО. ЖДИТЕ ВКЛЮЧЕНИЯ")
+    user = request.from_user
+
+    if was_processed(user.id):
         return
-    if not is_media(message):
-        await message.answer("❗ Отправьте фото или видео.")
-        return
-    user = message.from_user
-    admin_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Отправить фото или видео", callback_data=f"admin_reply_report:{user.id}")]
-    ])
-    uname = f"@{user.username}" if user.username else f"ID {user.id}"
-    for aid in ADMIN_IDS:
-        try:
-            await message.copy_to(aid, caption=f"📨 Отчёт от {uname}\nID: {user.id}")
-            await bot.send_message(aid, "Действия:", reply_markup=admin_kb)
-        except Exception as e:
-            logging.error(f"notify admin {aid}: {e}")
-    await message.answer("✅ Отчёт отправлен администрации.")
-    await state.clear()
 
-# ---------- ПРЕМИУМ ----------
-@router.callback_query(F.data == "menu_premium")
-async def cb_premium(call: CallbackQuery):
-    text = (
-        "💎 <b>PREMIUM на месяц</b>\n\n"
-        "1️⃣ Красивое выделение лота\n"
-        "2️⃣ Лот активен 12ч → 24ч\n"
-        "3️⃣ Поддержка в боте независимо от канала"
-    )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"Премиум {PREMIUM_PRICE} звёзд 💎", callback_data="buy_premium")],
-        [InlineKeyboardButton(text="< Выйти", callback_data="menu_main")],
-    ])
-    await safe_edit(call, text, kb)
-    await call.answer()
-
-@router.callback_query(F.data == "buy_premium")
-async def cb_buy_premium(call: CallbackQuery, bot: Bot):
     try:
-        await bot.send_invoice(
-            chat_id=call.from_user.id,
-            title="PREMIUM на месяц",
-            description="Красивое выделение лота, лот активен 24ч, поддержка в боте",
-            payload=f"premium:{call.from_user.id}",
-            provider_token="",
-            currency="XTR",
-            prices=[LabeledPrice(label="Premium", amount=PREMIUM_PRICE)],
+        # Принимаем заявку
+        await bot.approve_chat_join_request(
+            chat_id=request.chat.id,
+            user_id=user.id
         )
-    except Exception as e:
-        await call.answer(f"Ошибка: {e}", show_alert=True)
-        return
-    await call.answer()
 
-@router.pre_checkout_query()
-async def pre_checkout(query: PreCheckoutQuery):
-    await query.answer(ok=True)
-
-@router.message(F.successful_payment)
-async def on_payment(message: Message):
-    sp = message.successful_payment
-    try:
-        uid = int(sp.invoice_payload.split(":")[1])
-    except Exception:
-        return
-    current = premium_until.get(uid)
-    base = current if (current and current > datetime.now()) else datetime.now()
-    premium_until[uid] = base + timedelta(days=30)
-    await message.answer("💎 PREMIUM на месяц активирован!")
-
-# ---------- ПОДДЕРЖКА ----------
-@router.callback_query(F.data == "menu_support")
-async def cb_support(call: CallbackQuery, state: FSMContext):
-    if not is_premium(call.from_user.id):
-        text = "⛑️ <b>Поддержка</b>\n\nПоддержка доступна только премиум пользователям."
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Купить премиум 💎", callback_data="menu_premium")],
-            [InlineKeyboardButton(text="< Выйти", callback_data="menu_main")],
-        ])
-        await safe_edit(call, text, kb)
-        await call.answer()
-        return
-    await safe_edit(call, "⛑️ <b>Поддержка</b>\n\nНапишите ваш вопрос:", back_kb())
-    await state.set_state(S.support)
-    await call.answer()
-
-@router.message(S.support)
-async def h_support(message: Message, state: FSMContext, bot: Bot):
-    if not is_premium(message.from_user.id):
-        await message.answer("Только для премиум")
-        await state.clear()
-        return
-    if not message.text:
-        await message.answer("Отправьте текстовое сообщение.")
-        return
-    user = message.from_user
-    admin_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Ответить", callback_data=f"admin_reply_support:{user.id}")]
-    ])
-    uname = f"@{user.username}" if user.username else f"ID {user.id}"
-    for aid in ADMIN_IDS:
-        try:
-            await bot.send_message(
-                aid,
-                f"⛑️ Обращение от {uname} (ID: {user.id})\n\n{message.text}",
-                reply_markup=admin_kb,
-            )
-        except Exception as e:
-            logging.error(f"support notify: {e}")
-    await message.answer("✅ Обращение отправлено в поддержку.")
-    await state.clear()
-
-# ---------- ОБМЕН (лента) ----------
-@router.callback_query(F.data == "menu_exchange")
-async def cb_exchange(call: CallbackQuery, state: FSMContext):
-    # Если пользователь уже в обмене — предупреждаем
-    if call.from_user.id in user_joined_lot:
-        await call.answer("Вы уже в обмене. Введите /no чтобы выйти.", show_alert=True)
-        return
-    await state.clear()
-    text, kb = build_lots_list(0, call.from_user.id)
-    await safe_edit(call, text, kb)
-    await call.answer()
-
-@router.callback_query(F.data.startswith("lots_page:"))
-async def cb_lots_page(call: CallbackQuery):
-    page = int(call.data.split(":")[1])
-    text, kb = build_lots_list(page, call.from_user.id)
-    await safe_edit(call, text, kb)
-    await call.answer()
-
-# ---------- ПРОСМОТР ЛОТА ----------
-@router.callback_query(F.data.startswith("lot_view:"))
-async def cb_lot_view(call: CallbackQuery):
-    lot_id = int(call.data.split(":")[1])
-    lot = lots.get(lot_id)
-    if not lot or lot["status"] != "active":
-        await call.answer("Лот больше недоступен", show_alert=True)
-        return
-
-    owner = lot["owner"]
-    text = ""
-    if is_premium(owner):
-        text += "💎 <b><u>ПРЕМИУМ ПОЛЬЗОВАТЕЛЬ</u></b> 💎\n\n"
-
-    text += f"<b>{lot['text']}</b>\n\n"
-    text += f"🔁 Успешных обменов: {success_count.get(owner, 0)}\n\n"
-    text += strict_badge(lot) + "\n\n"
-    text += "<i>📎 Фото/видео скрыто до одобрения обмена администрацией.</i>"
-
-    kb_rows = []
-
-    if owner == call.from_user.id:
-        kb_rows.append([InlineKeyboardButton(
-            text="Отменить обмен ❌",
-            callback_data=f"lot_cancel:{lot_id}"
-        )])
-    else:
-        kb_rows.append([InlineKeyboardButton(
-            text="Войти в обмен ▶️",
-            callback_data=f"lot_join:{lot_id}"
-        )])
-
-    kb_rows.append([
-        InlineKeyboardButton(text="🔄 Обновить", callback_data=f"lot_view:{lot_id}"),
-        InlineKeyboardButton(text="📋 К ленте", callback_data="menu_exchange"),
-    ])
-
-    await safe_edit(call, text, InlineKeyboardMarkup(inline_keyboard=kb_rows))
-    await call.answer()
-
-# ---------- ОТМЕНА СВОЕГО ЛОТА ----------
-@router.callback_query(F.data.startswith("lot_cancel:"))
-async def cb_lot_cancel(call: CallbackQuery, bot: Bot):
-    lot_id = int(call.data.split(":")[1])
-    lot = lots.get(lot_id)
-    if not lot:
-        await call.answer("Нет лота", show_alert=True)
-        return
-    if call.from_user.id != lot["owner"] and not is_admin(call.from_user.id):
-        await call.answer("Не ваш лот", show_alert=True)
-        return
-    joiner = lot.get("joiner")
-    if joiner:
-        user_joined_lot.pop(joiner, None)
-        try:
-            await bot.send_message(joiner, "❌ Обмен был отменён владельцем лота.")
-        except Exception:
-            pass
-    lots.pop(lot_id, None)
-    user_to_lot.pop(lot["owner"], None)
-    await safe_edit(call, "❌ Лот отменён.", back_kb())
-    await call.answer("Отменено")
-
-# ---------- СОЗДАНИЕ ЛОТА ----------
-@router.callback_query(F.data == "lot_create")
-async def cb_lot_create(call: CallbackQuery, state: FSMContext):
-    if call.from_user.id in user_to_lot and user_to_lot[call.from_user.id] in lots:
-        await call.answer("У вас уже есть лот", show_alert=True)
-        return
-    await state.set_state(S.ex_text)
-    await safe_edit(
-        call,
-        "📝 Отправьте текст вашего лота (что меняете и что хотите получить):\n\n"
-        "<i>/cancel — отменить</i>",
-        back_kb(),
-    )
-    await call.answer()
-
-@router.message(S.ex_text)
-async def h_ex_text(message: Message, state: FSMContext):
-    if not message.text:
-        await message.answer("Отправьте текст.")
-        return
-    if len(message.text) > 500:
-        await message.answer("Слишком длинный текст, максимум 500 символов.")
-        return
-    await state.update_data(ex_text=message.text)
-    await state.set_state(S.ex_media)
-    await message.answer("📸 Отправьте ваше фото или видео для обмена:")
-
-@router.message(S.ex_media)
-async def h_ex_media(message: Message, state: FSMContext):
-    if not is_media(message):
-        await message.answer("❗ Отправьте фото или видео.")
-        return
-    await state.update_data(ex_media_chat=message.chat.id, ex_media_msg=message.message_id)
-    await state.set_state(S.ex_mode)
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Принимаю любой контент", callback_data="ex_mode:any")],
-        [InlineKeyboardButton(text="⚠️ СТРОГО — только по описанию", callback_data="ex_mode:strict")],
-    ])
-    await message.answer(
-        "⚙️ <b>Настройка лота</b>\n\n"
-        "Выберите, какой контент вы принимаете от участника:\n\n"
-        "✅ <b>Любой</b> — не обязательно строго совпадать с описанием.\n"
-        "⚠️ <b>Строго</b> — контент участника должен точно соответствовать вашему лоту.\n\n"
-        "Эта настройка будет крупно отображаться в карточке вашего лота.",
-        reply_markup=kb,
-        parse_mode=ParseMode.HTML,
-    )
-
-@router.callback_query(F.data.startswith("ex_mode:"))
-async def cb_ex_mode(call: CallbackQuery, state: FSMContext):
-    global lot_id_seq
-    if await state.get_state() != S.ex_mode.state:
-        await call.answer("Действие устарело", show_alert=True)
-        return
-    data = await state.get_data()
-    ex_text = data.get("ex_text")
-    ex_media = (data.get("ex_media_chat"), data.get("ex_media_msg"))
-    if not ex_text or not ex_media[0]:
-        await call.answer("Ошибка, начните заново", show_alert=True)
-        await state.clear()
-        return
-    if call.from_user.id in user_to_lot and user_to_lot[call.from_user.id] in lots:
-        await call.answer("У вас уже есть лот", show_alert=True)
-        await state.clear()
-        return
-
-    mode = call.data.split(":")[1]
-    accept_any = (mode == "any")
-
-    lot_id_seq += 1
-    lot_id = lot_id_seq
-    lots[lot_id] = {
-        "id": lot_id,
-        "owner": call.from_user.id,
-        "text": ex_text,
-        "media": ex_media,
-        "created": datetime.now(),
-        "status": "active",
-        "joiner": None,
-        "joiner_media": None,
-        "accept_any": accept_any,
-    }
-    user_to_lot[call.from_user.id] = lot_id
-    await state.clear()
-
-    badge = "✅ ПРИНИМАЕТ ЛЮБОЙ КОНТЕНТ" if accept_any else "⚠️ СТРОГО — ТОЛЬКО ПО ОПИСАНИЮ ЛОТА"
-    await safe_edit(
-        call,
-        f"✅ <b>Лот создан и опубликован в ленте!</b>\n\n"
-        f"Режим приёма: {badge}\n\n"
-        f"Когда кто-то войдёт в обмен — вы получите уведомление.",
-        back_kb(),
-    )
-    await call.answer("Лот создан")
-
-# ---------- ВХОД В ОБМЕН ----------
-@router.callback_query(F.data.startswith("lot_join:"))
-async def cb_lot_join(call: CallbackQuery, state: FSMContext, bot: Bot):
-    lot_id = int(call.data.split(":")[1])
-    lot = lots.get(lot_id)
-    if not lot or lot["status"] != "active":
-        await call.answer("Лот недоступен", show_alert=True)
-        return
-    if lot["owner"] == call.from_user.id:
-        await call.answer("Это ваш лот", show_alert=True)
-        return
-    if call.from_user.id in user_joined_lot:
-        await call.answer(
-            "Вы уже в другом обмене. Введите /no чтобы выйти.",
-            show_alert=True,
+        # Записываем статистику
+        save_accept(
+            user_id=user.id,
+            username=user.username,
+            full_name=user.full_name
         )
-        return
 
-    user_joined_lot[call.from_user.id] = lot_id
-    await state.update_data(join_lot=lot_id)
-    await state.set_state(S.join_media)
+        mark_processed(user.id)
 
-    mode_line = (
-        "✅ <b>Лот принимает ЛЮБОЙ контент</b> — можно присылать то, что считаете нужным."
-        if lot.get("accept_any")
-        else "⚠️ <b>СТРОГИЙ ЛОТ!</b> Контент <u>обязан точно соответствовать</u> описанию лота, иначе администрация отклонит обмен."
-    )
+        username = (
+            f"@{user.username}"
+            if user.username
+            else user.full_name
+        )
 
-    await call.message.answer(
-        f"📥 <b>Вы вошли в обмен!</b>\n\n"
-        f"<b>Описание лота:</b>\n{lot['text']}\n\n"
-        f"{mode_line}\n\n"
-        f"📸 Отправьте ваше фото или видео для обмена.\n\n"
-        f"Чтобы <b>выйти из обмена</b> — введите /no.",
-        parse_mode=ParseMode.HTML,
-    )
-    await call.answer("Вы вошли в обмен")
+        message = (
+            "┌ Заявка принята ➕\n"
+            f"├ {username}\n"
+            f"├ id: {user.id}\n"
+            f"└ {format_date(now())}"
+        )
 
-# ---------- /no — ВЫХОД ИЗ ОБМЕНА ----------
-@router.message(Command("no"))
-async def cmd_no(message: Message, state: FSMContext, bot: Bot):
-    uid = message.from_user.id
-    lot_id = user_joined_lot.get(uid)
-    if not lot_id or lot_id not in lots:
-        # Возможно состояние уже стерто, но записи нет — просто чистим
-        user_joined_lot.pop(uid, None)
-        await state.clear()
-        await message.answer("ℹ️ Вы не в обмене.", reply_markup=back_kb())
-        return
-
-    lot = lots[lot_id]
-    # Если обмен уже проверяется/одобрен — не даём выйти, чтобы не рвать медиа
-    if lot.get("status") not in ("active", "pending"):
-        await message.answer("⏳ Обмен уже на финальной стадии, отменить нельзя.")
-        return
-
-    # Отменяем
-    lot["status"] = "active"
-    prev_joiner = lot.get("joiner")
-    lot["joiner"] = None
-    lot["joiner_media"] = None
-    user_joined_lot.pop(uid, None)
-    await state.clear()
-
-    try:
-        await bot.send_message(lot["owner"], "❌ Участник вышел из обмена. Лот снова активен.")
-    except Exception:
-        pass
-
-    await message.answer("✅ Вы вышли из обмена.", reply_markup=back_kb())
-
-# ---------- ПРИЁМ МЕДИА ОТ УЧАСТНИКА ----------
-@router.message(S.join_media)
-async def h_join_media(message: Message, state: FSMContext, bot: Bot):
-    uid = message.from_user.id
-    if not is_media(message):
-        await message.answer("❗ Отправьте фото или видео, либо введите /no чтобы выйти.")
-        return
-    data = await state.get_data()
-    lot_id = data.get("join_lot")
-    lot = lots.get(lot_id) if lot_id else None
-    if not lot or lot["status"] != "active":
-        await message.answer("Лот больше недоступен.", reply_markup=back_kb())
-        await state.clear()
-        user_joined_lot.pop(uid, None)
-        return
-    if lot["owner"] == uid:
-        await message.answer("Это ваш лот.")
-        await state.clear()
-        user_joined_lot.pop(uid, None)
-        return
-
-    lot["status"] = "pending"
-    lot["joiner"] = uid
-    lot["joiner_media"] = (message.chat.id, message.message_id)
-
-    admin_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Разрешить ✅", callback_data=f"admin_approve:{lot_id}")],
-        [InlineKeyboardButton(text="Отклонить ❌", callback_data=f"admin_reject:{lot_id}")],
-    ])
-    badge = "✅ ПРИНИМАЕТ ЛЮБОЙ КОНТЕНТ" if lot.get("accept_any") else "⚠️ СТРОГО ПО ОПИСАНИЮ"
-
-    for aid in ADMIN_IDS:
-        try:
-            await bot.send_message(
-                aid,
-                f"🔔 <b>Новый обмен #{lot_id}</b>\n"
-                f"Режим лота: {badge}\n"
-                f"Владелец: <code>{lot['owner']}</code>\n"
-                f"Участник: <code>{lot['joiner']}</code>\n\n"
-                f"<b>Описание лота:</b>\n{lot['text']}\n\n"
-                f"➡️ Медиа владельца:",
-                parse_mode=ParseMode.HTML,
-            )
-            await bot.copy_message(aid, lot["media"][0], lot["media"][1])
-            await bot.send_message(aid, "➡️ Медиа участника (проверьте соответствие!):")
-            await bot.copy_message(aid, message.chat.id, message.message_id, reply_markup=admin_kb)
-        except Exception as e:
-            logging.error(f"admin notify obm: {e}")
-
-    await message.answer(
-        "✅ Ваш контент отправлен администрации на проверку. Ожидайте ответа.\n\n"
-        "<i>Если передумали — введите /no (пока админ не одобрил).</i>",
-        parse_mode=ParseMode.HTML,
-    )
-    await state.clear()
-
-# ---------- АДМИН: ОДОБРЕНИЕ ----------
-@router.callback_query(F.data.startswith("admin_approve:"))
-async def cb_admin_approve(call: CallbackQuery, bot: Bot):
-    if not is_admin(call.from_user.id):
-        await call.answer("Только для админов", show_alert=True)
-        return
-    lot_id = int(call.data.split(":")[1])
-    lot = lots.get(lot_id)
-    if not lot or lot["status"] != "pending":
-        await call.answer("Недоступно", show_alert=True)
-        return
-
-    owner = lot["owner"]
-    joiner = lot["joiner"]
-    joiner_media = lot["joiner_media"]
-
-    try:
-        # Владельцу — контент участника
-        await bot.copy_message(owner, joiner_media[0], joiner_media[1], caption="🎁 Ваш обмен получен")
-        # Участнику — контент владельца
-        await bot.copy_message(joiner, lot["media"][0], lot["media"][1], caption="🎁 Ваш обмен получен")
-    except Exception as e:
-        logging.error(f"exchange failed: {e}")
-        await call.message.answer(f"Ошибка при отправке: {e}")
-        return
-
-    success_count[owner] = success_count.get(owner, 0) + 1
-    success_count[joiner] = success_count.get(joiner, 0) + 1
-
-    lots.pop(lot_id, None)
-    user_to_lot.pop(owner, None)
-    user_joined_lot.pop(joiner, None)
-
-    try:
-        await bot.send_message(owner, "✅ <b>Обмен завершён!</b> Контент получен.", parse_mode=ParseMode.HTML)
-    except Exception:
-        pass
-    try:
-        await bot.send_message(joiner, "✅ <b>Обмен завершён!</b> Контент получен.", parse_mode=ParseMode.HTML)
-    except Exception:
-        pass
-
-    try:
-        await call.message.edit_reply_markup(reply_markup=None)
-        await call.message.answer(f"✅ ОДОБРЕНО (обмен #{lot_id})")
-    except Exception:
-        pass
-    await call.answer("Одобрено")
-
-# ---------- АДМИН: ОТКЛОНЕНИЕ ----------
-@router.callback_query(F.data.startswith("admin_reject:"))
-async def cb_admin_reject(call: CallbackQuery, bot: Bot):
-    if not is_admin(call.from_user.id):
-        await call.answer("Только для админов", show_alert=True)
-        return
-    lot_id = int(call.data.split(":")[1])
-    lot = lots.get(lot_id)
-    if not lot or lot["status"] != "pending":
-        await call.answer("Недоступно", show_alert=True)
-        return
-
-    owner = lot["owner"]
-    joiner = lot["joiner"]
-
-    reject_text = (
-        "❌ <b>ОБМЕН ЗАВЕРШЕН АДМИНИСТРАЦИЕЙ</b>\n\n"
-        "Контент, отправленный пользователем, <b>не соответствует лоту</b>."
-    )
-    for uid in (owner, joiner):
-        try:
-            await bot.send_message(uid, reject_text, parse_mode=ParseMode.HTML)
-        except Exception:
-            pass
-
-    # Лот возвращается в активные, участник откреплён
-    lot["status"] = "active"
-    lot["joiner"] = None
-    lot["joiner_media"] = None
-    user_joined_lot.pop(joiner, None)
-
-    try:
-        await call.message.edit_reply_markup(reply_markup=None)
-        await call.message.answer(f"❌ ОТКЛОНЕНО (обмен #{lot_id})")
-    except Exception:
-        pass
-    await call.answer("Отклонено")
-
-# ---------- АДМИН-КОМАНДЫ ----------
-@router.message(Command("admin"))
-async def cmd_admin(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-    text = (
-        "🛠 <b>Админ-команды</b>\n\n"
-        "/prem @username — выдать премиум\n"
-        "/unprem @username — забрать премиум\n"
-        "/ban @username — забанить\n"
-        "/unban @username — разбанить\n"
-        "/m @username текст — сообщение пользователю\n"
-        "/m текст — рассылка всем\n"
-        "/d_lot — удалить все лоты\n"
-        "/stop — остановить приём отчётов\n"
-        "/un_stop — возобновить приём\n"
-        "/obm — посмотреть все обмены"
-    )
-    await message.answer(text, parse_mode=ParseMode.HTML)
-
-@router.message(Command("prem"))
-async def cmd_prem(message: Message, command: CommandObject):
-    if not is_admin(message.from_user.id):
-        return
-    if not command.args:
-        await message.answer("Использование: /prem @username")
-        return
-    uid = resolve_user(command.args)
-    if not uid:
-        await message.answer("Пользователь не найден (пусть напишет /start)")
-        return
-    current = premium_until.get(uid)
-    base = current if (current and current > datetime.now()) else datetime.now()
-    premium_until[uid] = base + timedelta(days=30)
-    try:
-        await message.bot.send_message(uid, "💎 Вам выдан PREMIUM на месяц!")
-    except Exception:
-        pass
-    await message.answer(f"✅ Премиум выдан {uid}")
-
-@router.message(Command("unprem"))
-async def cmd_unprem(message: Message, command: CommandObject):
-    if not is_admin(message.from_user.id):
-        return
-    if not command.args:
-        return
-    uid = resolve_user(command.args)
-    if uid and uid in premium_until:
-        premium_until.pop(uid, None)
-        await message.answer(f"✅ Премиум забран у {uid}")
-    else:
-        await message.answer("Пользователь не был премиум")
-
-@router.message(Command("ban"))
-async def cmd_ban(message: Message, command: CommandObject):
-    if not is_admin(message.from_user.id):
-        return
-    if not command.args:
-        return
-    uid = resolve_user(command.args)
-    if not uid:
-        await message.answer("Не найден")
-        return
-    banned.add(uid)
-    try:
-        await message.bot.send_message(uid, "❌ ВАС ЗАБАНИЛИ В БОТЕ")
-    except Exception:
-        pass
-    await message.answer(f"✅ Забанен {uid}")
-
-@router.message(Command("unban"))
-async def cmd_unban(message: Message, command: CommandObject):
-    if not is_admin(message.from_user.id):
-        return
-    if not command.args:
-        return
-    uid = resolve_user(command.args)
-    banned.discard(uid)
-    await message.answer(f"✅ Разбанен {uid}")
-
-@router.message(Command("m"))
-async def cmd_m(message: Message, command: CommandObject, bot: Bot):
-    if not is_admin(message.from_user.id):
-        return
-    if not command.args:
-        return
-    args = command.args.strip()
-    if args.startswith("@"):
-        parts = args.split(" ", 1)
-        username = parts[0]
-        text = parts[1] if len(parts) > 1 else ""
-        uid = resolve_user(username)
-        if not uid:
-            await message.answer("Не найден")
-            return
-        try:
-            await bot.send_message(uid, f"📩 Сообщение от администрации:\n\n{text}")
-            await message.answer("✅ Отправлено")
-        except Exception as e:
-            await message.answer(f"Ошибка: {e}")
-    else:
-        sent = 0
-        seen = set()
-        for uid in known_users.values():
-            if uid in seen or uid in banned:
-                continue
-            seen.add(uid)
+        # Уведомляем администраторов
+        for admin_id in ADMINS:
             try:
-                await bot.send_message(uid, f"📢 Сообщение от администрации:\n\n{args}")
-                sent += 1
-            except Exception:
-                pass
-        await message.answer(f"✅ Отправлено {sent} пользователям")
+                await bot.send_message(
+                    chat_id=admin_id,
+                    text=message
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Не удалось отправить уведомление {admin_id}: {e}"
+                )
 
-@router.message(Command("d_lot"))
-async def cmd_d_lot(message: Message, bot: Bot):
-    if not is_admin(message.from_user.id):
-        return
-    # Уведомляем участников
-    for lot in list(lots.values()):
-        if lot.get("joiner"):
-            try:
-                await bot.send_message(lot["joiner"], "❌ Лот удалён администрацией.")
-            except Exception:
-                pass
-    lots.clear()
-    user_to_lot.clear()
-    user_joined_lot.clear()
-    await message.answer("✅ Все лоты удалены")
-
-@router.message(Command("stop"))
-async def cmd_stop(message: Message):
-    global report_stop
-    if not is_admin(message.from_user.id):
-        return
-    report_stop = True
-    await message.answer("🛑 Отчёты остановлены")
-
-@router.message(Command("un_stop"))
-async def cmd_un_stop(message: Message):
-    global report_stop
-    if not is_admin(message.from_user.id):
-        return
-    report_stop = False
-    await message.answer("✅ Отчёты возобновлены")
-
-@router.message(Command("obm"))
-async def cmd_obm(message: Message, bot: Bot):
-    if not is_admin(message.from_user.id):
-        return
-    if not lots:
-        await message.answer("Нет обменов")
-        return
-    for lot in list(lots.values()):
-        mode = "Любой" if lot.get("accept_any") else "Строго"
-        info = (
-            f"<b>Обмен #{lot['id']}</b> | статус: <code>{lot['status']}</code>\n"
-            f"Режим: {mode}\n"
-            f"Владелец: <code>{lot['owner']}</code>\n"
-            f"Участник: <code>{lot.get('joiner')}</code>\n"
-            f"Текст: {lot['text']}"
+        logger.info(
+            f"Принята заявка: {user.id} (@{user.username})"
         )
-        await message.answer(info, parse_mode=ParseMode.HTML)
-        try:
-            await bot.copy_message(message.chat.id, lot["media"][0], lot["media"][1])
-            if lot.get("joiner_media"):
-                await bot.copy_message(message.chat.id, lot["joiner_media"][0], lot["joiner_media"][1])
-        except Exception as e:
-            logging.error(f"obm copy: {e}")
 
-# ---------- ОТВЕТ АДМИНА ПОЛЬЗОВАТЕЛЮ ----------
-@router.callback_query(F.data.startswith("admin_reply_report:"))
-async def cb_admin_reply_report(call: CallbackQuery, state: FSMContext):
-    if not is_admin(call.from_user.id):
-        await call.answer("Только для админов", show_alert=True)
-        return
-    uid = int(call.data.split(":")[1])
-    await state.update_data(reply_to=uid, reply_caption="🎉 Награда за отчет")
-    await state.set_state(AS.reply)
-    await call.message.answer(f"Отправьте фото/видео/текст для пользователя {uid}:")
-    await call.answer()
-
-@router.callback_query(F.data.startswith("admin_reply_support:"))
-async def cb_admin_reply_support(call: CallbackQuery, state: FSMContext):
-    if not is_admin(call.from_user.id):
-        await call.answer("Только для админов", show_alert=True)
-        return
-    uid = int(call.data.split(":")[1])
-    await state.update_data(reply_to=uid, reply_caption="⛑️ Ответ поддержки")
-    await state.set_state(AS.reply)
-    await call.message.answer(f"Отправьте ответ пользователю {uid}:")
-    await call.answer()
-
-@router.message(AS.reply)
-async def h_admin_reply(message: Message, state: FSMContext, bot: Bot):
-    if not is_admin(message.from_user.id):
-        return
-    data = await state.get_data()
-    uid = data.get("reply_to")
-    caption = data.get("reply_caption", "")
-    if not uid:
-        await state.clear()
-        return
-    try:
-        if message.text:
-            txt = f"{caption}\n\n{message.text}" if caption else message.text
-            await bot.send_message(uid, txt)
-        else:
-            await message.copy_to(uid, caption=caption or None)
-        await message.answer("✅ Отправлено")
     except Exception as e:
-        await message.answer(f"Ошибка: {e}")
-    await state.clear()
+        logger.exception(
+            f"Ошибка обработки заявки {user.id}: {e}"
+        )
 
-# ================== ЗАПУСК ==================
+
+# ==============================
+# СТАТИСТИКА
+# ==============================
+
+@dp.message(Command("stat"))
+async def statistics(message: Message):
+
+    if message.from_user.id not in ADMINS:
+        return
+
+    current = now()
+
+    today_start = current.replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0
+    )
+
+    week_start = current - timedelta(days=7)
+
+    month_start = current.replace(
+        day=1,
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0
+    )
+
+    total = get_count()
+    today = get_count(today_start)
+    week = get_count(week_start)
+    month = get_count(month_start)
+
+    # Участники канала
+    try:
+        members = await bot.get_chat_member_count(CHANNEL_ID)
+        members_text = str(members)
+    except Exception:
+        members_text = "Недоступно"
+
+    # Последняя заявка
+    last = get_last()
+
+    if last:
+        last_dt = datetime.fromisoformat(last["accepted_at"])
+
+        last_user = (
+            f"@{last['username']}"
+            if last["username"]
+            else last["full_name"]
+        )
+
+        last_text = (
+            f"{last_user}\n"
+            f"ID: {last['user_id']}\n"
+            f"{format_date(last_dt)}"
+        )
+    else:
+        last_text = "Пока заявок нет"
+
+    text = (
+        "📊 <b>Статистика канала</b>\n"
+        "\n"
+        f"👥 Участников канала: <b>{members_text}</b>\n"
+        "\n"
+        "📥 <b>Принятые заявки</b>\n"
+        f"├ Всего: <b>{total}</b>\n"
+        f"├ Сегодня: <b>{today}</b>\n"
+        f"├ За 7 дней: <b>{week}</b>\n"
+        f"└ За месяц: <b>{month}</b>\n"
+        "\n"
+        "🕒 <b>Последняя заявка</b>\n"
+        f"{last_text}\n"
+        "\n"
+        f"📅 Обновлено: {format_date(current)}"
+    )
+
+    await message.answer(
+        text,
+        parse_mode="HTML"
+    )
+
+
+# ==============================
+# ЗАПУСК
+# ==============================
+
 async def main():
-    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    dp = Dispatcher(storage=MemoryStorage())
+    logger.info("Бот запущен!")
 
-    dp.message.middleware(UserTrackMiddleware())
-    dp.callback_query.middleware(UserTrackMiddleware())
-    dp.message.middleware(BanMiddleware())
-    dp.callback_query.middleware(BanMiddleware())
+    await dp.start_polling(
+        bot,
+        allowed_updates=dp.resolve_used_update_types()
+    )
 
-    dp.include_router(router)
-
-    await bot.delete_webhook(drop_pending_updates=True)
-    logging.info("Bot started")
-    await dp.start_polling(bot)
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        pass
+    finally:
+        db.close()
